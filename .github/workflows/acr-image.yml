@@ -44,6 +44,7 @@ jobs:
           npm run check:boundaries
           node --test src/tooling/productionServer.test.mjs src/tooling/acr*.test.mjs \
             src/tooling/deploymentDocs.test.mjs \
+            src/tooling/aksAuth.test.mjs \
             src/overpassRegional*.test.mjs src/overpassProxy.test.mjs \
             src/data/overpassProxy.test.mjs src/sources/overpassFeatures.test.mjs \
             src/data/traffic*.test.mjs src/layers/traffic/navigation.test.mjs \

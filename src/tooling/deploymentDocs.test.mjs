@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const guides = ['docs/AKS.md', 'docs/ACR-CI.md'];
+const guides = ['docs/AKS.md', 'docs/ACR-CI.md', 'docs/AKS-AUTH.md'];
 
 function blocks(text, language) {
   return [...text.matchAll(/^([ \t]*)```(\w+)\n([\s\S]*?)^\1```/gm)]

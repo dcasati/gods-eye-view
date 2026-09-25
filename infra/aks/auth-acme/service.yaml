@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gods-eye-view-acme
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gods-eye-view-acme
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

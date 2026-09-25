@@ -4,6 +4,10 @@ This guide deploys God's Eye View to Azure Kubernetes Service (AKS). The applica
 uses a `ClusterIP` service and is accessed through `kubectl port-forward`, without
 an application ingress, public load balancer, or public hostname.
 
+For optional single-tenant Entra authentication and gated public HTTPS, follow
+[Entra-Protected Public Access](AKS-AUTH.md). It keeps the app and road services
+private and makes oauth2-proxy the only public application path, without Istio.
+
 You can create a cluster and Azure Container Registry (ACR), or use existing
 resources. Resource names, image digests, and cluster credentials stay in your
 local configuration rather than in the shared manifests.
