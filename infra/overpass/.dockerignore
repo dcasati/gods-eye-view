@@ -2,4 +2,5 @@
 !Dockerfile
 !bootstrap.py
 !server.py
+!profiles.py
 !selftest.py

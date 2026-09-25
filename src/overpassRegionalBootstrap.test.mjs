@@ -1,8 +1,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir, rm, readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+
+test('regional image build context includes each explicitly copied source module', async () => {
+  const dockerfile = await readFile('infra/overpass/Dockerfile', 'utf8');
+  const ignore = await readFile('infra/overpass/.dockerignore', 'utf8');
+  const sources = dockerfile
+    .match(/^COPY (.+) \/opt\/regional\/$/m)[1]
+    .split(' ');
+  for (const source of sources)
+    assert.ok(
+      ignore.split('\n').includes(`!${source}`),
+      `${source} excluded from image`,
+    );
+});
 
 for (const region of ['austin', 'calgary']) {
   test(`${region} bootstrap activates only validated imports and refresh preserves previous snapshot`, async () => {
