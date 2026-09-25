@@ -351,46 +351,45 @@ test('Calgary failures fall back globally, never to the Austin-only database', a
       },
     );
 
-    test('Calgary HTTP adapter containment matches application routing at every edge', () => {
-      const queries = [
-        road('51.04,-114.08,51.06,-114.05'),
-        road(calgary.bounds.join(',')),
-        road('50.69,-114.08,51.06,-114.05'),
-        road('51.04,-114.61,51.06,-114.05'),
-        road('51.04,-114.08,51.41,-114.05'),
-        road('51.04,-114.08,51.06,-113.59'),
-        road(),
-        ...unsupported,
-      ];
-      const child = spawnSync(
-        'python3',
-        [
-          '-B',
-          '-c',
-          `
-    import json, sys
-    sys.path.insert(0, "infra/overpass")
-    from server import safe_query
-    from profiles import load_profile
-    _, profile = load_profile()
-    print(json.dumps([safe_query(q, profile["bounds"]) for q in json.load(sys.stdin)]))
-    `,
-        ],
-        {
-          input: JSON.stringify(queries),
-          encoding: 'utf8',
-          env: { ...process.env, OVERPASS_REGION: 'calgary' },
-        },
-      );
-      assert.equal(child.status, 0, child.stderr);
-      assert.deepEqual(
-        JSON.parse(child.stdout),
-        queries.map((query) =>
-          isRegionalRoadQuery(form(query), calgary.bounds),
-        ),
-      );
-    });
     assert.deepEqual(tried, failed ? [calgary.url, ...globals] : [calgary.url]);
     assert.equal(result.endpoint, failed ? globals[0] : calgary.url);
   }
+});
+
+test('Calgary HTTP adapter containment matches application routing at every edge', () => {
+  const queries = [
+    road('51.04,-114.08,51.06,-114.05'),
+    road(calgary.bounds.join(',')),
+    road('50.69,-114.08,51.06,-114.05'),
+    road('51.04,-114.61,51.06,-114.05'),
+    road('51.04,-114.08,51.41,-114.05'),
+    road('51.04,-114.08,51.06,-113.59'),
+    road(),
+    ...unsupported,
+  ];
+  const child = spawnSync(
+    'python3',
+    [
+      '-B',
+      '-c',
+      [
+        'import json, sys',
+        'sys.path.insert(0, "infra/overpass")',
+        'from server import safe_query',
+        'from profiles import load_profile',
+        '_, profile = load_profile()',
+        'print(json.dumps([safe_query(q, profile["bounds"]) for q in json.load(sys.stdin)]))',
+      ].join('\n'),
+    ],
+    {
+      input: JSON.stringify(queries),
+      encoding: 'utf8',
+      env: { ...process.env, OVERPASS_REGION: 'calgary' },
+    },
+  );
+  assert.equal(child.status, 0, child.stderr);
+  assert.deepEqual(
+    JSON.parse(child.stdout),
+    queries.map((query) => isRegionalRoadQuery(form(query), calgary.bounds)),
+  );
 });
