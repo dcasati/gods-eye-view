@@ -288,3 +288,17 @@ test('Azure federation matches the fork immutable OIDC subject and only main', (
   assert.match(template, /subject: githubOidcSubject/);
   assert.match(template, /scope: registry/);
 });
+
+test('publication artifacts include the two explicit receipts in the hidden output directory', () => {
+  const workflow = readFileSync(
+    new URL('../../.github/workflows/acr-image.yml', import.meta.url),
+    'utf8',
+  );
+  const receiptStep = workflow
+    .split('- name: Retain publication receipt')[1]
+    .split('- name: Remove registry credentials')[0];
+  assert.match(receiptStep, /include-hidden-files: true/);
+  assert.match(receiptStep, /\.ci-output\/publication\.json/);
+  assert.match(receiptStep, /\.ci-output\/publication-overpass\.json/);
+  assert.doesNotMatch(receiptStep, /\.ci-output\/\*/);
+});
