@@ -48,7 +48,11 @@ test('documented overlay generator supports another registry, namespace and both
     'python',
   )[0];
   assert.ok(script);
-  for (const regional of ['false', 'true']) {
+  for (const [regional, calgary] of [
+    ['false', 'false'],
+    ['true', 'false'],
+    ['true', 'true'],
+  ]) {
     const result = spawnSync('python3', ['-c', script], {
       cwd: root,
       encoding: 'utf8',
@@ -60,6 +64,7 @@ test('documented overlay generator supports another registry, namespace and both
         APP_IMAGE_DIGEST: `sha256:${'a'.repeat(64)}`,
         REGIONAL_IMAGE_DIGEST: `sha256:${'b'.repeat(64)}`,
         USE_AUSTIN_EXAMPLE: regional,
+        USE_CALGARY_EXAMPLE: calgary,
       },
     });
     assert.equal(result.status, 0, result.stderr);
@@ -74,7 +79,14 @@ test('documented overlay generator supports another registry, namespace and both
     );
     assert.equal(
       path.resolve(directory, overlay.resources[0]),
-      path.join(root, regional === 'true' ? 'infra/aks/regional' : 'infra/aks'),
+      path.join(
+        root,
+        calgary === 'true'
+          ? 'infra/aks/calgary'
+          : regional === 'true'
+            ? 'infra/aks/regional'
+            : 'infra/aks',
+      ),
     );
   }
 });

@@ -6,6 +6,7 @@ import re
 import subprocess
 import threading
 import urllib.parse
+from profiles import load_profile, smoke_query, validate_snapshot
 
 SLOTS = threading.BoundedSemaphore(2)
 NUMBER = r"-?\d+(?:\.\d+)?"
@@ -29,10 +30,12 @@ def main():
     # Resolve once: refresh activation never mixes DB files for in-flight readers.
     snapshot = Path("/db/current").resolve(strict=True)
     metadata = json.loads((snapshot / "snapshot.json").read_text())
+    _, profile = load_profile()
+    validate_snapshot(metadata, profile)
     database = snapshot / "database"
     smoke = subprocess.run(
         ["/app/bin/osm3s_query", f"--db-dir={database}"],
-        input='[out:json][timeout:10];way["highway"](30.26,-97.75,30.28,-97.73);out count;',
+        input=smoke_query(profile),
         text=True, capture_output=True, timeout=20, check=True,
     )
     checked = json.loads(smoke.stdout)

@@ -1,4 +1,4 @@
-"""Build an immutable roads-only Austin snapshot; never modify a serving DB."""
+"""Build an immutable regional roads-only snapshot; never modify a serving DB."""
 import datetime
 import hashlib
 import json
@@ -8,11 +8,9 @@ import subprocess
 import sys
 import urllib.request
 import uuid
+from profiles import load_profile, smoke_query, validate_snapshot
 
 ROOT = Path("/db")
-BOUNDS = [29.9, -98.2, 30.7, -97.2]  # south, west, north, east
-SOURCE = "https://download.geofabrik.de/north-america/us/texas-latest.osm.pbf"
-SMOKE_QUERY = '[out:json][timeout:10];way["highway"](30.26,-97.75,30.28,-97.73);out count;'
 
 
 def run(*args):
@@ -21,13 +19,15 @@ def run(*args):
 
 
 def main():
+    region, profile = load_profile()
+    bounds, source = profile["bounds"], profile["source"]
     current = ROOT / "current"
-    if current.exists() and "--refresh" not in sys.argv:
+    if current.exists():
         metadata = json.loads((current / "snapshot.json").read_text())
-        if metadata["bounds"] != BOUNDS:
-            raise RuntimeError("Existing snapshot coverage mismatch; refusing reuse")
-        print("Reusing snapshot", metadata, flush=True)
-        return
+        validate_snapshot(metadata, profile)
+        if "--refresh" not in sys.argv:
+            print("Reusing snapshot", metadata, flush=True)
+            return
     marker = ROOT / "bootstrap-in-progress"
     initial = not current.exists() and "--refresh" not in sys.argv
     if initial and marker.exists():
@@ -40,28 +40,29 @@ def main():
     stage.mkdir(parents=True)
     if initial:
         marker.write_text(str(stage) + "\n")
-    texas, crop, roads = (stage / name for name in ("texas.osm.pbf", "crop.osm.pbf", "roads.osm.pbf"))
+    extract, crop, roads = (stage / name for name in ("source.osm.pbf", "crop.osm.pbf", "roads.osm.pbf"))
     # Failed imports stay isolated for diagnosis; no current data or cache is deleted.
     sha = hashlib.sha256()
-    print("Downloading public Geofabrik Texas extract", flush=True)
-    request = urllib.request.Request(SOURCE, headers={"User-Agent": "gods-eye-view/0.1 (+https://github.com/bilawalsidhu/gods-eye-view)"})
-    with urllib.request.urlopen(request, timeout=120) as response, texas.open("wb") as output:
+    print(f"Downloading public Geofabrik extract for {region}: {source}", flush=True)
+    request = urllib.request.Request(source, headers={"User-Agent": "gods-eye-view/0.1 (+https://github.com/bilawalsidhu/gods-eye-view)"})
+    with urllib.request.urlopen(request, timeout=120) as response, extract.open("wb") as output:
         resolved_url = response.url
         modified = response.headers.get("Last-Modified")
         while chunk := response.read(1024 * 1024):
             output.write(chunk)
             sha.update(chunk)
     timestamp = subprocess.check_output(
-        ["osmium", "fileinfo", "-g", "header.option.osmosis_replication_timestamp", str(texas)],
+        ["osmium", "fileinfo", "-g", "header.option.osmosis_replication_timestamp", str(extract)],
         text=True,
     ).strip()
     if not timestamp:
         timestamp = subprocess.check_output(
-            ["osmium", "fileinfo", "-e", "-g", "data.timestamp.last", str(texas)], text=True
+            ["osmium", "fileinfo", "-e", "-g", "data.timestamp.last", str(extract)], text=True
         ).strip()
     if not timestamp:
         raise RuntimeError("Source snapshot has no timestamp; refusing undated data")
-    run("osmium", "extract", "--bbox=-98.2,29.9,-97.2,30.7", "--strategy=complete_ways", str(texas), "-o", str(crop))
+    south, west, north, east = bounds
+    run("osmium", "extract", f"--bbox={west},{south},{east},{north}", "--strategy=complete_ways", str(extract), "-o", str(crop))
     run("osmium", "tags-filter", str(crop), "w/highway", "-o", str(roads))
     database = stage / "database"
     database.mkdir()
@@ -81,21 +82,21 @@ def main():
     if imported.returncode or conversion_status:
         raise RuntimeError("OSM conversion/import failed")
     smoke = subprocess.run(
-        ["/app/bin/osm3s_query", f"--db-dir={database}"], input=SMOKE_QUERY,
+        ["/app/bin/osm3s_query", f"--db-dir={database}"], input=smoke_query(profile),
         text=True, capture_output=True, timeout=30, check=True,
     )
     data = json.loads(smoke.stdout)
     if data.get("remark") or not any(int(e.get("tags", {}).get("ways", 0)) > 0 for e in data["elements"]):
-        raise RuntimeError("Austin downtown contains no roads; refusing snapshot activation")
+        raise RuntimeError(f"{region} downtown contains no roads; refusing snapshot activation")
     metadata = {
-        "id": snapshot_id, "bounds": BOUNDS, "contents": "highway ways and referenced nodes only",
-        "source": SOURCE, "resolved_source": resolved_url, "source_last_modified": modified,
+        "id": snapshot_id, "region": region, "bounds": bounds, "contents": "highway ways and referenced nodes only",
+        "source": source, "resolved_source": resolved_url, "source_last_modified": modified,
         "source_sha256": sha.hexdigest(), "osm_timestamp": timestamp,
         "imported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "overpass_version": "0.7.62.11", "updates": "manual immutable snapshot replacement",
     }
     (stage / "snapshot.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    for intermediate in (texas, crop, roads):
+    for intermediate in (extract, crop, roads):
         intermediate.unlink()
     link = ROOT / ("activate-" + snapshot_id)
     link.symlink_to(stage.relative_to(ROOT), target_is_directory=True)

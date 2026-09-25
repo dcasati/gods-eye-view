@@ -30,6 +30,25 @@ function endpoint(value, name) {
   return url.href;
 }
 
+function regionBounds(bounds, name) {
+  const [south, west, north, east] = Array.isArray(bounds) ? bounds : [];
+  if (
+    !Array.isArray(bounds) ||
+    bounds.length !== 4 ||
+    !bounds.every(Number.isFinite) ||
+    south < -90 ||
+    north > 90 ||
+    west < -180 ||
+    east > 180 ||
+    south >= north ||
+    west >= east
+  )
+    throw new Error(
+      `${name}: expected south,west,north,east without antimeridian crossing`,
+    );
+  return bounds;
+}
+
 function loadOverpassSourceConfig(env = process.env, defaults = []) {
   let upstreams = defaults;
   if (env.OVERPASS_UPSTREAMS_JSON !== undefined) {
@@ -47,33 +66,48 @@ function loadOverpassSourceConfig(env = process.env, defaults = []) {
   }
   const url = env.OVERPASS_REGIONAL_URL;
   const rawBounds = env.OVERPASS_REGIONAL_BOUNDS;
+  if (env.OVERPASS_REGIONS_JSON !== undefined) {
+    if (url !== undefined || rawBounds !== undefined)
+      throw new Error(
+        'OVERPASS_REGIONS_JSON cannot be combined with legacy OVERPASS_REGIONAL settings',
+      );
+    let regions;
+    try {
+      regions = JSON.parse(env.OVERPASS_REGIONS_JSON);
+    } catch {
+      throw new Error('OVERPASS_REGIONS_JSON: expected nonempty JSON array');
+    }
+    if (!Array.isArray(regions) || !regions.length)
+      throw new Error('OVERPASS_REGIONS_JSON: expected nonempty JSON array');
+    return {
+      upstreams,
+      regions: regions.map((region) => ({
+        url: endpoint(region?.url, 'OVERPASS_REGIONS_JSON'),
+        bounds: regionBounds(region?.bounds, 'OVERPASS_REGIONS_JSON'),
+      })),
+    };
+  }
   if (url === undefined && rawBounds === undefined)
-    return { upstreams, regional: null };
+    return { upstreams, regions: [] };
   if (!url || !rawBounds)
     throw new Error(
       'OVERPASS_REGIONAL_URL and OVERPASS_REGIONAL_BOUNDS must be set together',
     );
   const parts = rawBounds.split(',');
   const bounds = parts.map(Number);
-  const [south, west, north, east] = bounds;
-  if (
-    parts.length !== 4 ||
-    parts.some((p) => !/^-?\d+(?:\.\d+)?$/.test(p.trim())) ||
-    !bounds.every(Number.isFinite) ||
-    south < -90 ||
-    north > 90 ||
-    west < -180 ||
-    east > 180 ||
-    south >= north ||
-    west >= east
-  ) {
+  if (parts.some((p) => !/^-?\d+(?:\.\d+)?$/.test(p.trim()))) {
     throw new Error(
       'OVERPASS_REGIONAL_BOUNDS: expected south,west,north,east without antimeridian crossing',
     );
   }
   return {
     upstreams,
-    regional: { url: endpoint(url, 'OVERPASS_REGIONAL_URL'), bounds },
+    regions: [
+      {
+        url: endpoint(url, 'OVERPASS_REGIONAL_URL'),
+        bounds: regionBounds(bounds, 'OVERPASS_REGIONAL_BOUNDS'),
+      },
+    ],
   };
 }
 
@@ -110,12 +144,10 @@ function isRegionalRoadQuery(body, bounds) {
 }
 
 function overpassEndpointsForBody(body, config) {
-  return config.regional && isRegionalRoadQuery(body, config.regional.bounds)
-    ? [
-        config.regional.url,
-        ...config.upstreams.filter((url) => url !== config.regional.url),
-      ]
-    : config.upstreams;
+  const regional = config.regions
+    .filter((region) => isRegionalRoadQuery(body, region.bounds))
+    .map((region) => region.url);
+  return [...new Set([...regional, ...config.upstreams])];
 }
 
 export {

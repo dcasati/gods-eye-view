@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../regional
+  - overpass.yaml
+patches:
+  - target:
+      kind: ConfigMap
+      name: gods-eye-view-config
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: gods-eye-view-config
+      data:
+        OVERPASS_REGIONAL_URL: null
+        OVERPASS_REGIONAL_BOUNDS: null
+        OVERPASS_REGIONS_JSON: '[{"url":"http://overpass-austin/api/interpreter","bounds":[29.9,-98.2,30.7,-97.2]},{"url":"http://overpass-calgary/api/interpreter","bounds":[50.7,-114.6,51.4,-113.6]}]'

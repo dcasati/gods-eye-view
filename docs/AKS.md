@@ -16,7 +16,7 @@ local configuration rather than in the shared manifests.
 | Kubernetes Secret          | Holds provider API keys at runtime, never at image build time.                                            |
 | ConfigMap                  | Holds non-sensitive application and provider settings.                                                    |
 | Persistent cache           | Retains provider responses when the application pod is replaced.                                          |
-| Optional regional Overpass | Provides a bounded, roads-only OpenStreetMap snapshot. The included example covers Austin, not the world. |
+| Optional regional Overpass | Provides bounded, roads-only OpenStreetMap snapshots for Austin and optionally Calgary metro, not the world. |
 | AKS kubelet identity       | Pulls images from ACR using `AcrPull`, without a registry password.                                       |
 
 The [GitHub Actions pipeline](ACR-CI.md) can build and publish images separately.
@@ -55,6 +55,7 @@ export NAMESPACE="gods-eye-view"
 export NODE_VM_SIZE="Standard_D4s_v5"
 export ADMIN_IP_CIDR="<your-workstation-public-ip>/32"
 export USE_AUSTIN_EXAMPLE="false"
+export USE_CALGARY_EXAMPLE="false"
 export AKS_OVERLAY_DIR=".azure/aks"
 ```
 
@@ -68,6 +69,7 @@ export AKS_OVERLAY_DIR=".azure/aks"
 | `NODE_VM_SIZE`                      | Available amd64 VM size with adequate CPU and memory.              |
 | `ADMIN_IP_CIDR`                     | Public egress IP allowed to reach a newly created AKS API server.  |
 | `USE_AUSTIN_EXAMPLE`                | Explicitly opt into the additional Austin database and workload.   |
+| `USE_CALGARY_EXAMPLE`               | Add Calgary metro alongside Austin; requires `USE_AUSTIN_EXAMPLE=true`. |
 | `AKS_OVERLAY_DIR`                   | Untracked deployment configuration beneath `.azure/`.              |
 
 ## Create the Registry and AKS Cluster
@@ -196,8 +198,9 @@ contain a downloaded OSM database.
 ## Create Your Local Deployment Configuration
 
 The base at `infra/aks` deploys only the application and its cache. The alternative
-base at `infra/aks/regional` also deploys the Austin example. Neither contains an
-operator's registry or a published deployment digest.
+base at `infra/aks/regional` also deploys Austin. `infra/aks/calgary` adds Calgary
+alongside Austin. None contains an operator's registry or a published deployment
+digest. Set both example flags to `true` for the Austin + Calgary profile.
 
 The following creates an untracked Kustomize overlay using your selected namespace
 and verified image digests. JSON is valid YAML and is accepted by Kustomize.
@@ -210,8 +213,11 @@ import re
 
 env = os.environ
 regional = env["USE_AUSTIN_EXAMPLE"]
+calgary = env.get("USE_CALGARY_EXAMPLE", "false")
 if regional not in ("true", "false"):
     raise SystemExit("USE_AUSTIN_EXAMPLE must be true or false")
+if calgary not in ("true", "false") or (calgary == "true" and regional != "true"):
+    raise SystemExit("USE_CALGARY_EXAMPLE must be true or false and requires Austin")
 directory = Path(env["AKS_OVERLAY_DIR"])
 if not directory.resolve().is_relative_to(Path(".azure").resolve()):
     raise SystemExit("Keep local configuration beneath .azure/")
@@ -226,7 +232,8 @@ for name, variable in [
     if not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
         raise SystemExit(f"{variable} must be a verified digest")
     images.append({"name": name, "newName": f"{env['ACR_LOGIN_SERVER']}/{name}", "digest": digest})
-base = Path("infra/aks/regional" if regional == "true" else "infra/aks")
+base = Path("infra/aks/calgary" if calgary == "true" else
+            "infra/aks/regional" if regional == "true" else "infra/aks")
 overlay = {
     "apiVersion": "kustomize.config.k8s.io/v1beta1",
     "kind": "Kustomization",
@@ -402,21 +409,53 @@ flow**. A working TomTom key cannot replace missing OSM roads. TomTom supports
 Canada, including traffic data around Calgary, but road requests can still fail
 when public Overpass mirrors refuse or time out.
 
-The optional Austin example covers latitude **29.9–30.7** and longitude
-**-98.2–-97.2**. It downloads a public Geofabrik Texas extract, crops complete
-ways, imports highway ways and their referenced nodes, and verifies downtown
-roads before activating an immutable snapshot. It does **not** cover Calgary.
-For another region, use an appropriate road source; changing only the
-ConfigMap bounds does not expand the database. The current example's importer
-and startup checks are Austin-specific and must be adapted together.
+| Profile | Latitude | Longitude | Public source | Snapshot PVC |
+| ------- | -------- | --------- | ------------- | ------------ |
+| Austin | 29.9–30.7 | -98.2–-97.2 | Geofabrik Texas | 64Gi |
+| Calgary metro | 50.7–51.4 | -114.6–-113.6 | Geofabrik Alberta | 16Gi |
+
+Calgary coverage includes the city and nearby Airdrie, Cochrane, Chestermere,
+and Okotoks inside that rectangle. It is **not all Alberta**; Edmonton, Banff,
+and queries crossing the rectangle remain on global sources. Import downloads
+the Alberta extract, then crops complete ways and retains only highway ways and
+referenced nodes. Download/crop intermediates are removed after validation.
+
+`OVERPASS_REGION` selects the backend profile (`austin` by default, or `calgary`)
+for **both** the import and server containers. Profiles share import/startup
+checks, validate downtown road data before activation, and reject reuse or
+refresh of a PVC belonging to another region. Existing Austin snapshots remain
+compatible. Changing application bounds alone cannot expand a database.
+
+The Calgary overlay replaces the legacy single-region settings with
+`OVERPASS_REGIONS_JSON`, a nonempty array of `{"url": "...", "bounds": [south,
+west, north, east]}`. Do not combine it with `OVERPASS_REGIONAL_URL` /
+`OVERPASS_REGIONAL_BOUNDS`. Endpoints are private service URLs; global sources
+remain in `OVERPASS_UPSTREAMS_JSON`. Bad configuration fails startup.
+
+After selecting the Calgary overlay, verify its separate import and rollout:
+
+```bash
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
+  logs deployment/overpass-calgary -c import --follow
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
+  rollout status deployment/overpass-calgary --timeout=7200s
+curl --fail --data-urlencode \
+  'data=[out:json][timeout:25];(way["highway"](51.04,-114.08,51.06,-114.05););out geom qt;' \
+  http://127.0.0.1:4173/api/overpass
+```
+
+The response should contain nonempty road ways with geometry. In the browser,
+navigate to downtown Calgary and enable Street Traffic; confirm roads finish
+loading and the traffic status reports dots and TomTom coverage. This animation
+combines road geometry with traffic-flow estimates, not individually tracked cars.
 
 Only fully contained, supported highway-bbox queries use the regional service.
 Outside, boundary, admin, and unfamiliar queries stay on global sources.
 Regional failures fall back to global mirrors; no regional empty response is
 presented as authoritative data for another city.
 
-The database PVC is 64Gi; the application cache PVC is 8Gi (Azure may bill a
-larger minimum disk tier). The regional init and server each request 1 CPU /
+Snapshot PVC sizes are listed above; the application cache PVC is 8Gi (Azure may
+bill a larger minimum disk tier). Each regional init and server requests 1 CPU /
 2Gi and limit 2 CPU / 6Gi; they run sequentially. Import duration depends on
 download speed and disk performance. `/healthz` on the regional service reports
 the source OSM timestamp and snapshot metadata, not a claim of real-time updates.
@@ -427,6 +466,9 @@ regional image digest, and create a refresh Job only after scaling the regional
 Deployment to zero and waiting for its pod to terminate. Restore one replica
 afterward, even if the refresh fails. Never remove the PVC or current snapshot
 as a troubleshooting shortcut.
+For Calgary, also change the Job name/PVC to `overpass-calgary-refresh-` /
+`overpass-calgary-data` and set its import container's `OVERPASS_REGION=calgary`.
+Never run the default Austin refresh Job against the Calgary PVC.
 
 ## Troubleshooting
 

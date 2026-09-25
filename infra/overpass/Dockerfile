@@ -4,7 +4,7 @@ USER root
 RUN mkdir -p /opt/regional /db && chown 1000:1000 /db \
     && test -x /app/bin/update_database && test -x /app/bin/osm3s_query \
     && command -v osmium && command -v python3
-COPY bootstrap.py server.py selftest.py /opt/regional/
+COPY bootstrap.py server.py profiles.py selftest.py /opt/regional/
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /db
 USER 1000:1000

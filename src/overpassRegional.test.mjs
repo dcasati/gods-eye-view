@@ -26,7 +26,7 @@ test('only wholly contained, supported road queries prefer regional', () => {
   for (const bbox of ['30.26,-97.75,30.28,-97.73', bounds.join(',')]) {
     assert.equal(isRegionalRoadQuery(form(road(bbox)), bounds), true);
     assert.deepEqual(overpassEndpointsForBody(form(road(bbox)), config), [
-      config.regional.url,
+      config.regions[0].url,
       ...globals,
     ]);
   }
@@ -80,7 +80,7 @@ test('admin, around, non-road, malformed, mixed and unbounded queries stay globa
 test('defaults and operator full-planet overrides are explicit and server-only', () => {
   assert.deepEqual(loadOverpassSourceConfig({}, globals), {
     upstreams: globals,
-    regional: null,
+    regions: [],
   });
   const custom = loadOverpassSourceConfig(
     {
@@ -185,10 +185,10 @@ test('regional failures, runtime errors and invalid 200s fall through to full-pl
       sourceConfig: config,
       fetchImpl: async (url) => {
         tried.push(url);
-        if (url === config.regional.url && failure instanceof Error)
+        if (url === config.regions[0].url && failure instanceof Error)
           throw failure;
         const answer =
-          url === config.regional.url
+          url === config.regions[0].url
             ? failure
             : { status: 200, body: '{"elements":[{"type":"way","id":1}]}' };
         return { ...answer, headers: { get: () => 'application/json' } };
@@ -211,12 +211,12 @@ test('regional failures, runtime errors and invalid 200s fall through to full-pl
         });
         const expected = bbox.startsWith('40')
           ? globals[0]
-          : config.regional.url;
+          : config.regions[0].url;
         assert.equal(result.endpoint, expected);
         assert.deepEqual(tried, [expected]);
       }
     });
-    assert.deepEqual(tried, [config.regional.url, ...globals]);
+    assert.deepEqual(tried, [config.regions[0].url, ...globals]);
     assert.equal(result.endpoint, globals[0]);
   }
 });
@@ -235,6 +235,7 @@ test('Python regional adapter applies the same conservative road grammar', () =>
       '-c',
       `
 import importlib.util, json, sys
+sys.path.insert(0, "infra/overpass")
 spec = importlib.util.spec_from_file_location("regional", "infra/overpass/server.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -248,4 +249,148 @@ print(json.dumps([module.safe_query(q, [29.9,-98.2,30.7,-97.2]) for q in json.lo
     JSON.parse(child.stdout),
     queries.map((q) => isRegionalRoadQuery(form(q), bounds)),
   );
+});
+
+const calgary = {
+  url: 'http://overpass-calgary/api/interpreter',
+  bounds: [50.7, -114.6, 51.4, -113.6],
+};
+const multi = loadOverpassSourceConfig(
+  { OVERPASS_REGIONS_JSON: JSON.stringify([...config.regions, calgary]) },
+  globals,
+);
+
+test('Calgary and Austin route independently; cross-region and edge queries stay global', () => {
+  assert.deepEqual(overpassEndpointsForBody(form(road()), multi), [
+    config.regions[0].url,
+    ...globals,
+  ]);
+  for (const bbox of ['51.04,-114.08,51.06,-114.05', calgary.bounds.join(',')])
+    assert.deepEqual(overpassEndpointsForBody(form(road(bbox)), multi), [
+      calgary.url,
+      ...globals,
+    ]);
+  for (const bbox of [
+    '50.69,-114.08,51.06,-114.05',
+    '51.04,-114.61,51.06,-114.05',
+    '51.04,-114.08,51.41,-114.05',
+    '51.04,-114.08,51.06,-113.59',
+    '53.5,-113.6,53.6,-113.4',
+  ])
+    assert.deepEqual(
+      overpassEndpointsForBody(form(road(bbox)), multi),
+      globals,
+    );
+  const both = road().replace(
+    '););',
+    ');way["highway"](51.04,-114.08,51.06,-114.05););',
+  );
+  assert.deepEqual(overpassEndpointsForBody(form(both), multi), globals);
+  for (const query of unsupported)
+    assert.deepEqual(overpassEndpointsForBody(form(query), multi), globals);
+});
+
+test('multi-region configuration rejects malformed coverage and ambiguous legacy settings', () => {
+  for (const value of [
+    '',
+    '{}',
+    '[]',
+    'null',
+    '[null]',
+    JSON.stringify([
+      {
+        ...calgary,
+        bounds: [50.7, '-114.6', 51.4, -113.6],
+      },
+    ]),
+    JSON.stringify([{ ...calgary, bounds: [51.4, -114.6, 50.7, -113.6] }]),
+    JSON.stringify([
+      { ...calgary, url: 'https://regional.example/?key=secret' },
+    ]),
+  ]) {
+    assert.throws(
+      () => loadOverpassSourceConfig({ OVERPASS_REGIONS_JSON: value }, globals),
+      /OVERPASS_REGIONS_JSON/,
+    );
+  }
+  assert.throws(
+    () =>
+      loadOverpassSourceConfig(
+        {
+          OVERPASS_REGIONS_JSON: JSON.stringify([calgary]),
+          OVERPASS_REGIONAL_URL: config.regions[0].url,
+          OVERPASS_REGIONAL_BOUNDS: bounds.join(','),
+        },
+        globals,
+      ),
+    /cannot be combined/,
+  );
+});
+
+test('Calgary failures fall back globally, never to the Austin-only database', async () => {
+  for (const failed of [true, false]) {
+    const tried = [];
+    const result = await fetchOverpassPayload(
+      form(road('51.04,-114.08,51.06,-114.05')),
+      1e6,
+      {
+        sourceConfig: multi,
+        fetchImpl: async (url) => {
+          tried.push(url);
+          return {
+            status: 200,
+            headers: { get: () => 'application/json' },
+            body:
+              failed && url === calgary.url
+                ? '{"error":"bad snapshot"}'
+                : '{"elements":[{"type":"way","id":2}]}',
+          };
+        },
+        readBody: async (response) => response.body,
+        simplify: (body) => body,
+      },
+    );
+
+    test('Calgary HTTP adapter containment matches application routing at every edge', () => {
+      const queries = [
+        road('51.04,-114.08,51.06,-114.05'),
+        road(calgary.bounds.join(',')),
+        road('50.69,-114.08,51.06,-114.05'),
+        road('51.04,-114.61,51.06,-114.05'),
+        road('51.04,-114.08,51.41,-114.05'),
+        road('51.04,-114.08,51.06,-113.59'),
+        road(),
+        ...unsupported,
+      ];
+      const child = spawnSync(
+        'python3',
+        [
+          '-B',
+          '-c',
+          `
+    import json, sys
+    sys.path.insert(0, "infra/overpass")
+    from server import safe_query
+    from profiles import load_profile
+    _, profile = load_profile()
+    print(json.dumps([safe_query(q, profile["bounds"]) for q in json.load(sys.stdin)]))
+    `,
+        ],
+        {
+          input: JSON.stringify(queries),
+          encoding: 'utf8',
+          env: { ...process.env, OVERPASS_REGION: 'calgary' },
+        },
+      );
+      assert.equal(child.status, 0, child.stderr);
+      assert.deepEqual(
+        JSON.parse(child.stdout),
+        queries.map((query) =>
+          isRegionalRoadQuery(form(query), calgary.bounds),
+        ),
+      );
+    });
+    assert.deepEqual(tried, failed ? [calgary.url, ...globals] : [calgary.url]);
+    assert.equal(result.endpoint, failed ? globals[0] : calgary.url);
+  }
 });

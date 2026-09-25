@@ -140,7 +140,7 @@ async function fetchOverpassPayload(
         );
         continue;
       }
-      if (endpoint === sourceConfig.regional?.url) {
+      if (sourceConfig.regions.some((region) => endpoint === region.url)) {
         // A broken private service must not poison the durable last-good cache.
         try {
           const data = JSON.parse(responseBody);

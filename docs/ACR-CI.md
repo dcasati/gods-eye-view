@@ -23,8 +23,10 @@ The build job has only `contents: read`. The publisher has `contents: read` and
 scripts. Its scripts come from the original fork commit.
 
 The workflow publishes `gods-eye-view` and `overpass-austin` repositories inside
-your ACR. The latter is an **optional Austin-only example**, not a global road
-service; building it does not download a regional database or deploy it.
+your ACR. The latter retains its original repository name for compatibility but
+supports **Austin and Calgary snapshot profiles**, not a global road service.
+Building it does not download a regional database or deploy it. Both regional
+Deployments use the same image digest with different runtime profiles and PVCs.
 
 ## Prerequisites
 
