@@ -1,0 +1,111 @@
+name: Build and publish ACR image
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 7 * * *'
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: acrmiracaldova-gods-eye-view
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'dcasati/gods-eye-view' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    outputs:
+      downstream: ${{ steps.sources.outputs.downstream }}
+      upstream: ${{ steps.sources.outputs.upstream }}
+      tag: ${{ steps.sources.outputs.tag }}
+    env:
+      PUPPETEER_SKIP_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Merge latest canonical upstream into downstream source
+        id: sources
+        run: bash scripts/ci/assemble-source.sh
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.14.0
+      - name: Install and test production additions
+        run: |
+          npm ci --no-audit --no-fund
+          npm run check:boundaries
+          node --test src/tooling/productionServer.test.mjs src/tooling/acr*.test.mjs \
+            src/overpassRegional*.test.mjs src/overpassProxy.test.mjs \
+            src/data/overpassProxy.test.mjs src/sources/overpassFeatures.test.mjs \
+            src/data/traffic*.test.mjs src/layers/traffic/navigation.test.mjs \
+            src/layers/traffic/source.test.mjs \
+            src/navigationPolicy.test.mjs
+      - name: Build amd64 application and regional Overpass images without credentials
+        env:
+          DOWNSTREAM_SHA: ${{ steps.sources.outputs.downstream }}
+          UPSTREAM_SHA: ${{ steps.sources.outputs.upstream }}
+        run: bash scripts/ci/build-images.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: container-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-output/image.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.repository == 'dcasati/gods-eye-view' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ACR_NAME: acrmiracaldova
+      ACR_LOGIN_SERVER: acrmiracaldova.azurecr.io
+      IMAGE_NAME: gods-eye-view
+      IMAGE_TAG: ${{ needs.build.outputs.tag }}
+      DOWNSTREAM_SHA: ${{ needs.build.outputs.downstream }}
+      UPSTREAM_SHA: ${{ needs.build.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate trust boundary and identity configuration before Azure login
+        run: bash scripts/ci/validate-publish.sh
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: container-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-output
+      - name: Load tested images (never execute upstream code in this job)
+        run: docker load --input .ci-output/image.tar.gz
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2 (official commit)
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Push, lock version tag, and record digest
+        run: bash scripts/ci/publish-image.sh
+      - name: Retain publication receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-output/publication*.json
+          retention-days: 90
+          if-no-files-found: error
+      - name: Remove registry credentials
+        if: always()
+        run: docker logout acrmiracaldova.azurecr.io

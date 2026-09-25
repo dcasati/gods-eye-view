@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: overpass-austin-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: managed-csi
+  resources:
+    requests:
+      storage: 64Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: overpass-austin
+  labels:
+    app.kubernetes.io/name: overpass-austin
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 10800
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: overpass-austin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: overpass-austin
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: import
+          image: acrmiracaldova.azurecr.io/overpass-austin:PLACEHOLDER
+          args: ['/opt/regional/bootstrap.py']
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 6Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ['ALL']
+          volumeMounts:
+            - name: data
+              mountPath: /db
+      containers:
+        - name: overpass
+          image: acrmiracaldova.azurecr.io/overpass-austin:PLACEHOLDER
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 6Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ['ALL']
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          volumeMounts:
+            - name: data
+              mountPath: /db
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: overpass-austin-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: overpass-austin
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: overpass-austin
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Does not enable/change cluster CNI enforcement. When enforced, only the app's
+# pods in this namespace may query this private snapshot service.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: overpass-austin-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: overpass-austin
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gods-eye-view
+      ports:
+        - protocol: TCP
+          port: 8080

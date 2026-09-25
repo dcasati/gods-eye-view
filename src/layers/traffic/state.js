@@ -220,6 +220,8 @@ export function createState({ services }) {
   layerState._retryTimer = null;
   layerState._retryDelayMs = 1500;
   layerState._retryBoundsKey = null;
+  layerState._retryBounds = null;
+  layerState._roadFailures = 0;
   layerState._roadError = null;
 
   /** @type {number} 0–100 int — matched roads / roads with any flow candidates */

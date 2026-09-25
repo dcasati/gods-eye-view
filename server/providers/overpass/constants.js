@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { loadOverpassSourceConfig } from './regional.js';
 
 // ---------------------------------------------------------------------------
 // Overpass API proxy constants and cache state
@@ -17,7 +18,7 @@ const OVERPASS_USER_AGENT =
   'gods-eye-view/0.1 (+https://github.com/bilawalsidhu/gods-eye-view)';
 
 /** Ordered list of Overpass API mirrors; tried sequentially on failure/rate-limit. */
-const OVERPASS_UPSTREAMS = [
+const DEFAULT_OVERPASS_UPSTREAMS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
   'https://lz4.overpass-api.de/api/interpreter',
@@ -27,6 +28,12 @@ const OVERPASS_UPSTREAMS = [
   // Verified: planet coverage (Texas query), CORS *, ~5-20 s cold latency.
   'https://overpass.private.coffee/api/interpreter',
 ];
+// Evaluated at server module load: invalid operator configuration fails startup.
+const OVERPASS_SOURCE_CONFIG = loadOverpassSourceConfig(
+  process.env,
+  DEFAULT_OVERPASS_UPSTREAMS,
+);
+const OVERPASS_UPSTREAMS = OVERPASS_SOURCE_CONFIG.upstreams;
 
 /**
  * TTL for FRESH cached Overpass responses (ms). Road geometry is static for
@@ -143,6 +150,7 @@ export {
   OVERPASS_SIMPLIFY_TOLERANCE_DEG,
   OVERPASS_MAX_RESPONSE_BYTES,
   OVERPASS_UPSTREAMS,
+  OVERPASS_SOURCE_CONFIG,
   OVERPASS_USER_AGENT,
   OVERPASS_TIMEOUT_MS,
 };

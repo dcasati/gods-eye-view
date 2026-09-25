@@ -43,6 +43,8 @@ export const FAST_FETCH_ALTITUDE = 4500;
 
 export const FETCH_DEBOUNCE = 320;
 
+export const ROAD_MAX_ATTEMPTS = 3;
+
 /** @const {number} Meters — vertical offset to keep dots above clamped terrain surface */
 
 export const DOT_HEIGHT_OFFSET = 3.0;

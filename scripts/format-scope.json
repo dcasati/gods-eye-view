@@ -120,6 +120,7 @@
   "server/providers/overpass/constants.js",
   "server/providers/overpass/geometry.js",
   "server/providers/overpass/query.js",
+  "server/providers/overpass/regional.js",
   "server/providers/overpass/transport.js",
   "server/providers/regional.js",
   "server/providers/regional/briefing.js",

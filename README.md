@@ -89,6 +89,12 @@ Start with the included data sources, then add your own. Each layer is a separat
 
 ## ⚡ Quick Start
 
+For a private Kubernetes deployment with runtime Secrets and ConfigMaps, see
+[Deploy on AKS](docs/AKS.md). That setup uses a ClusterIP service and
+`kubectl port-forward`, not a public endpoint.
+The [ACR build pipeline](docs/ACR-CI.md) builds latest upstream plus the fork's
+deployment fixes and publishes immutable images using GitHub OIDC.
+
 **Start without an account or API keys.** Both paths open the same app with
 Esri satellite imagery and keyless terrain. OSM is the fallback if Esri is
 unreachable. Flights, military traffic, satellites, earthquakes, public

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as Cesium from 'cesium';
 import { createTrafficLayer } from './index.js';
+import { layerFeedState } from '../../data/feedState.js';
 
 function deferred() {
   let resolve;
@@ -234,9 +235,9 @@ test('a declined road request reaches the row as the reason, not as a shrug', as
 
   status = 429;
   for (let i = 0; i < 20; i++) await tick(1500);
-  assert.equal(
+  assert.match(
     layer.getStats().error,
-    'Overpass rate-limited',
+    /^Overpass rate-limited/,
     'a rate limit is a different instruction to the reader than a refusal',
   );
 });
@@ -251,4 +252,73 @@ test('an unclassified road failure keeps the general line', async (t) => {
   layer.enable(viewer);
   await tick(400);
   assert.equal(layer.getStats().error, 'Road data temporarily unavailable');
+});
+
+test('a pending same-viewport retry preserves the refusal and unavailable state', async (t) => {
+  let calls = 0;
+  let retryBounds;
+  const pending = deferred();
+  const { layer, viewer, tick } = setup(t, async (bounds) => {
+    calls++;
+    retryBounds = bounds;
+    return calls === 1 ? { ok: false, status: 406 } : pending.promise;
+  });
+  layer.enable(viewer);
+  await tick(400);
+  await tick(1500);
+  await tick(400);
+  assert.equal(calls, 2);
+  const stats = layer.getStats();
+  assert.equal(stats.error, 'Overpass refused the road query (HTTP 406)');
+  assert.equal(
+    stats.loading,
+    false,
+    'background retries must not mask the failure',
+  );
+  assert.equal(layerFeedState(stats), 'unavailable');
+  pending.resolve(roads(retryBounds));
+  await tick(0);
+  assert.equal(layer.getStats().error, null);
+  assert.equal(layer.getStats().status, undefined);
+});
+
+test('exhausted retries stay parked despite camera events and the enable kick', async (t) => {
+  let calls = 0;
+  const { layer, viewer, tick, move } = setup(t, async () => {
+    calls++;
+    return { ok: false, status: 406 };
+  });
+  layer.enable(viewer);
+  for (let i = 0; i < 20; i++) await tick(1000);
+  assert.equal(calls, 3);
+  assert.match(layer.getStats().error, /automatic retries paused/);
+  for (let i = 0; i < 20; i++) {
+    viewer.camera.changed.raiseEvent();
+    viewer.camera.moveEnd.raiseEvent();
+    await tick(1000);
+  }
+  assert.equal(calls, 3);
+
+  move(-97.7439, 30.267);
+  await tick(400);
+  assert.equal(
+    calls,
+    3,
+    'small camera jitter does not reset the attempt budget',
+  );
+
+  move(-0.1276, 51.5072);
+  await tick(400);
+  assert.equal(
+    calls,
+    4,
+    'a genuinely new destination has a fresh attempt budget',
+  );
+  assert.doesNotMatch(layer.getStats().error, /retries paused/);
+
+  layer.disable(viewer);
+  assert.equal(layer.getStats().error, null);
+  layer.enable(viewer);
+  await tick(400);
+  assert.equal(calls, 5, 'toggling the layer allows an explicit retry');
 });

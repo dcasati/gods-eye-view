@@ -3,6 +3,9 @@ import {
   OVERPASS_URL,
   TILE_CACHE_MAX_ENTRIES,
   FAST_FETCH_ALTITUDE,
+  ROAD_MAX_ATTEMPTS,
+  OVERLAP_THRESHOLD,
+  MIN_CENTER_SHIFT_KM,
 } from './policy.js';
 import { RoadRequestError, roadRequestError } from './source.js';
 
@@ -155,6 +158,33 @@ export function createIngestion({
    */
 
   async function loadRoadsForBounds(bounds, altitude, trace = null) {
+    const clamped = parts.viewport.clampBounds(bounds);
+    const cacheKey = `${clamped.south.toFixed(4)},${clamped.west.toFixed(4)},${clamped.north.toFixed(4)},${clamped.east.toFixed(4)}`;
+    const sameDestination =
+      layerState._retryBounds &&
+      parts.viewport.boundsOverlap(
+        clamped,
+        layerState._retryBounds,
+        OVERLAP_THRESHOLD,
+      ) &&
+      parts.viewport.distanceKm(
+        parts.viewport.getBoundsCenter(clamped),
+        parts.viewport.getBoundsCenter(layerState._retryBounds),
+      ) < MIN_CENTER_SHIFT_KM;
+    if (sameDestination) {
+      if (
+        layerState._roadFailures >= ROAD_MAX_ATTEMPTS ||
+        layerState._retryTimer ||
+        layerState._fetching
+      )
+        return;
+    } else {
+      layerState._retryBounds = clamped;
+      layerState._retryDelayMs = 1500;
+      layerState._roadFailures = 0;
+      layerState._roadError = null;
+    }
+    layerState._retryBoundsKey = cacheKey;
     // Increment generation to invalidate any in-flight responses from prior calls
     const generation = ++layerState._loadGeneration;
     cancelActiveFetch();
@@ -163,16 +193,6 @@ export function createIngestion({
     layerState._flowPending = 0;
     layerState._activeFetchAbort = new AbortController();
     const requestSignal = layerState._activeFetchAbort.signal;
-    const clamped = parts.viewport.clampBounds(bounds);
-
-    // Cache key: fixed-precision bounding-box string for deterministic lookups
-    const cacheKey = `${clamped.south.toFixed(4)},${clamped.west.toFixed(4)},${clamped.north.toFixed(4)},${clamped.east.toFixed(4)}`;
-
-    if (cacheKey !== layerState._retryBoundsKey) {
-      layerState._retryBoundsKey = cacheKey;
-      layerState._retryDelayMs = 1500;
-    }
-    layerState._roadError = null;
 
     // Live mode: warm the flow-tile cache CONCURRENTLY with the Overpass road
     // fetch — sequential fetches doubled first-paint latency (field-test
@@ -199,6 +219,13 @@ export function createIngestion({
     layerState._lastBounds = clamped;
     layerState._lastViewCenter = parts.viewport.getBoundsCenter(clamped);
     let renderedSomething = false;
+    const recordSuccess = () => {
+      renderedSomething = true;
+      if (generation !== layerState._loadGeneration) return;
+      layerState._roadError = null;
+      layerState._roadFailures = 0;
+      layerState._retryDelayMs = 1500;
+    };
 
     try {
       let cache = layerState._tileCache.get(cacheKey);
@@ -225,6 +252,7 @@ export function createIngestion({
           'Cache full',
           trace,
         );
+        if (renderedSomething) recordSuccess();
         return;
       }
 
@@ -241,7 +269,7 @@ export function createIngestion({
           ))
         )
           return;
-        renderedSomething = true;
+        recordSuccess();
       } else {
         // Fetch major roads first (smaller payload, faster response)
         console.log(`[Data:Traffic] Fast fetch major roads [${cacheKey}]`);
@@ -271,7 +299,7 @@ export function createIngestion({
           ))
         )
           return;
-        renderedSomething = true;
+        recordSuccess();
       }
 
       // At higher altitude, major roads provide sufficient motion density
@@ -305,10 +333,11 @@ export function createIngestion({
         ))
       )
         return;
-      renderedSomething = true;
+      recordSuccess();
     } catch (e) {
       if (e?.name === 'AbortError') return;
       if (generation === layerState._loadGeneration && !renderedSomething) {
+        layerState._roadFailures += 1;
         // A refusal we classified carries its own line; anything else — a
         // dropped connection, a malformed snapshot — keeps the general one,
         // because `e.message` from the platform is not a sentence anyone
@@ -329,7 +358,10 @@ export function createIngestion({
         if (!renderedSomething) {
           layerState._lastBounds = prevBounds;
           layerState._lastViewCenter = prevViewCenter;
-          if (layerState._enabled) {
+          if (
+            layerState._enabled &&
+            layerState._roadFailures < ROAD_MAX_ATTEMPTS
+          ) {
             layerState._retryTimer = setTimeout(() => {
               layerState._retryTimer = null;
               parts.viewport.onCameraChanged();

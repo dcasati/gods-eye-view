@@ -2,7 +2,7 @@ import {
   trafficBucketTier,
   trafficStyleProfile,
 } from '../../data/trafficPresetStyle.js';
-import { TRAFFIC_TIMING_ENABLED } from './policy.js';
+import { ROAD_MAX_ATTEMPTS, TRAFFIC_TIMING_ENABLED } from './policy.js';
 
 export function createControls({ state: layerState, services, parts, source }) {
   const { getFlowSessionStats } = source;
@@ -141,7 +141,9 @@ export function createControls({ state: layerState, services, parts, source }) {
       // Outstanding flow work counts as loading: the paint race can leave a
       // TomTom request in flight after the roads have settled, and the shared
       // loading batch has to stay open long enough to announce its failure.
-      const loading = layerState._fetching || layerState._flowPending > 0;
+      const loading =
+        !layerState._roadError &&
+        (layerState._fetching || layerState._flowPending > 0);
       const feed = parts.model.trafficFeedPresentation({
         liveMode: layerState._liveMode,
         fetching: loading,
@@ -153,8 +155,15 @@ export function createControls({ state: layerState, services, parts, source }) {
         count: layerState._count,
         lastUpdate: layerState._lastUpdate,
         loading,
+        ...(layerState._roadError && layerState._count === 0
+          ? { status: 'unavailable' }
+          : {}),
         mode: feed.mode,
-        error: layerState._roadError || feed.error,
+        error: layerState._roadError
+          ? layerState._roadFailures >= ROAD_MAX_ATTEMPTS
+            ? `${layerState._roadError} — automatic retries paused; move to another area or toggle Street Traffic to retry`
+            : layerState._roadError
+          : feed.error,
         flowCoveragePct: layerState._flowCoveragePct,
         tilesFetched: getFlowSessionStats().tilesFetched,
         ...(TRAFFIC_TIMING_ENABLED

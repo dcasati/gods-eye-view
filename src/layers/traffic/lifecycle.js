@@ -1,5 +1,5 @@
 import * as Cesium from 'cesium';
-import { TRAFFIC_TIMING_ENABLED } from './policy.js';
+import { ROAD_MAX_ATTEMPTS, TRAFFIC_TIMING_ENABLED } from './policy.js';
 import {
   claimCameraSensitivity,
   releaseCameraSensitivity,
@@ -42,6 +42,10 @@ export function createLifecycle({
       layerState._lastViewCenter = null;
       layerState._flowCoveragePct = 0;
       layerState._flowError = null;
+      layerState._roadFailures = 0;
+      layerState._retryBoundsKey = null;
+      layerState._retryBounds = null;
+      layerState._roadError = null;
       if (TRAFFIC_TIMING_ENABLED) {
         layerState._trafficTimingCurrentAnchor = null;
         layerState._trafficTimingSequence = 0;
@@ -117,7 +121,11 @@ export function createLifecycle({
       // failed first fetch left the viewport unloaded while parked.
       clearInterval(layerState._enableKickTimer);
       layerState._enableKickTimer = setInterval(() => {
-        if (!layerState._enabled || layerState._lastUpdate) {
+        if (
+          !layerState._enabled ||
+          layerState._lastUpdate ||
+          layerState._roadFailures >= ROAD_MAX_ATTEMPTS
+        ) {
           clearInterval(layerState._enableKickTimer);
           layerState._enableKickTimer = null;
           return;
@@ -142,6 +150,9 @@ export function createLifecycle({
       clearTimeout(layerState._retryTimer);
       layerState._retryTimer = null;
       layerState._retryDelayMs = 1500;
+      layerState._roadFailures = 0;
+      layerState._retryBoundsKey = null;
+      layerState._retryBounds = null;
       parts.ingestion.cancelActiveFetch();
       layerState._loadGeneration++;
       layerState._fetching = false;

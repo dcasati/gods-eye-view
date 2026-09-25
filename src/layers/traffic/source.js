@@ -1,6 +1,8 @@
 import { normalizeOverpassRoads } from '../../sources/overpassRoads.js';
 export { normalizeOverpassRoads } from '../../sources/overpassRoads.js';
 import { createFlowTileSource } from './flowSource.js';
+
+export const ROAD_REQUEST_TIMEOUT_MS = 95000;
 function buildOverpassQuery(
   south,
   west,
@@ -108,19 +110,39 @@ export function createTrafficSource({
         majorOnly,
         timeoutSec,
       });
-      const response = await fetchImpl('/api/overpass', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'data=' + encodeURIComponent(query),
-        signal,
-      });
+      const timeout = AbortSignal.timeout(ROAD_REQUEST_TIMEOUT_MS);
+      const requestSignal = signal
+        ? AbortSignal.any([signal, timeout])
+        : timeout;
+      let response;
+      try {
+        response = await fetchImpl('/api/overpass', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'data=' + encodeURIComponent(query),
+          signal: requestSignal,
+        });
+        requestSignal.throwIfAborted();
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        if (timeout.aborted) throw roadRequestError(504);
+        throw error;
+      }
       signal?.throwIfAborted();
       return {
         ok: response.ok,
         status: response.status,
         headers: response.headers,
         async json() {
-          const body = await response.json();
+          let body;
+          try {
+            body = await response.json();
+            requestSignal.throwIfAborted();
+          } catch (error) {
+            if (signal?.aborted) throw error;
+            if (timeout.aborted) throw roadRequestError(504);
+            throw error;
+          }
           signal?.throwIfAborted();
           if (!Array.isArray(body?.elements))
             throw new Error('Malformed road snapshot');

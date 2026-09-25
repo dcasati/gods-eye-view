@@ -1,11 +1,12 @@
 import {
   OVERPASS_MAX_RESPONSE_BYTES,
-  OVERPASS_UPSTREAMS,
+  OVERPASS_SOURCE_CONFIG,
   OVERPASS_USER_AGENT,
   OVERPASS_TIMEOUT_MS,
 } from './constants.js';
 import { readResponseTextCapped } from '../common/http.js';
 import { simplifyOverpassPayloadBody } from './geometry.js';
+import { overpassEndpointsForBody } from './regional.js';
 
 /**
  * Detect whether an Overpass API response body indicates rate-limiting.
@@ -73,7 +74,8 @@ async function fetchOverpassPayload(
   body,
   maxResponseBytes = OVERPASS_MAX_RESPONSE_BYTES,
   {
-    endpoints = OVERPASS_UPSTREAMS,
+    sourceConfig = OVERPASS_SOURCE_CONFIG,
+    endpoints = overpassEndpointsForBody(body, sourceConfig),
     fetchImpl = fetch,
     readBody = readResponseTextCapped,
     simplify = simplifyOverpassPayloadBody,
@@ -137,6 +139,17 @@ async function fetchOverpassPayload(
           `Overpass upstream returned ${status} (${endpoint})`,
         );
         continue;
+      }
+      if (endpoint === sourceConfig.regional?.url) {
+        // A broken private service must not poison the durable last-good cache.
+        try {
+          const data = JSON.parse(responseBody);
+          if (!Array.isArray(data.elements) || data.remark)
+            throw new Error('Not Overpass data');
+        } catch {
+          lastError = new Error('Regional Overpass returned invalid data');
+          continue;
+        }
       }
 
       // Success: decimate giant boundary geometry before it reaches the cache,

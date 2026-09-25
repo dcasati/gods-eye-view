@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gods-eye-view-config
+data:
+  NODE_ENV: production
+  HOST: "0.0.0.0"
+  PORT: "4173"
+  OPENSKY_AUTH_MODE: anon
+  OPENAI_REALTIME_MODEL: gpt-realtime-2
+  OPENAI_REALTIME_MODEL_MINI: gpt-realtime-2.1-mini
+  OPENAI_REALTIME_VOICE: marin
+  OPENAI_REALTIME_REASONING_EFFORT: low
+  OPENAI_REALTIME_CONTEXT_TOKENS: "3000"
+  OPENAI_REALTIME_CONTEXT_RETENTION: "0.5"
+  OPENAI_HUD_SUMMARY_MODEL: gpt-5-nano
+  GEV_RATELIMIT_GOOGLE_PER_MIN: "60"
+  GEV_RATELIMIT_OPENAI_PER_MIN: "30"
+  VITE_AIS_LIVE_API_URL: /api/ais-live
+  VITE_AIS_LIVE_MAX_ROWS: "12000"
+  VITE_AIS_LIVE_LABEL_MAX_ROWS: "900"
+  TOMTOM_DAILY_TILE_BUDGET: "6000"
+  OVERPASS_REGIONAL_URL: http://overpass-austin.gods-eye-view.svc.cluster.local/api/interpreter
+  OVERPASS_REGIONAL_BOUNDS: "29.9,-98.2,30.7,-97.2"

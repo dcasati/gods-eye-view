@@ -202,6 +202,7 @@
       "server/providers/overpass/constants.js",
       "server/providers/overpass/geometry.js",
       "server/providers/overpass/query.js",
+      "server/providers/overpass/regional.js",
       "server/providers/overpass/transport.js",
       "server/providers/places/routes.js",
       "src/data/placeProviderPayloads.js",
@@ -225,6 +226,7 @@
       "server/providers/military-installations/query.js",
       "server/providers/overpass/constants.js",
       "server/providers/overpass/geometry.js",
+      "server/providers/overpass/regional.js",
       "server/providers/overpass/transport.js",
       "src/sources/httpBody.js",
       "src/sources/rateLimit.js"

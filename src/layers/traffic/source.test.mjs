@@ -3,6 +3,7 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import {
   RoadRequestError,
+  ROAD_REQUEST_TIMEOUT_MS,
   createTrafficSource,
   roadRequestError,
 } from './source.js';
@@ -149,10 +150,50 @@ test('road body parsing retains the source request cancellation signal', async (
       },
     }),
   });
+
   const response = await source.requestRoads(bounds, {
     signal: controller.signal,
   });
   await assert.rejects(response.json(), { name: 'AbortError' });
+});
+
+test('a road request deadline reports a timeout, not a navigation cancellation', async (t) => {
+  const deadline = new AbortController();
+  t.mock.method(AbortSignal, 'timeout', (milliseconds) => {
+    assert.equal(milliseconds, ROAD_REQUEST_TIMEOUT_MS);
+    return deadline.signal;
+  });
+  const source = createTrafficSource({
+    fetchImpl: async (_, { signal }) => {
+      deadline.abort(new DOMException('Deadline exceeded', 'TimeoutError'));
+      signal.throwIfAborted();
+    },
+  });
+  await assert.rejects(source.requestRoads(bounds), {
+    name: 'RoadRequestError',
+    status: 504,
+    message: 'Overpass timed out',
+  });
+});
+
+test('the road deadline includes response body consumption', async (t) => {
+  const deadline = new AbortController();
+  t.mock.method(AbortSignal, 'timeout', () => deadline.signal);
+  const source = createTrafficSource({
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => {
+        deadline.abort(new DOMException('Deadline exceeded', 'TimeoutError'));
+        return { elements: [] };
+      },
+    }),
+  });
+  const response = await source.requestRoads(bounds);
+  await assert.rejects(response.json(), {
+    name: 'RoadRequestError',
+    status: 504,
+  });
 });
 
 test('road sources decode direction and coordinates before scene construction', async () => {
