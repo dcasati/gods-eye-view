@@ -68,11 +68,23 @@ The credential has these exact settings:
 | -------- | ------------------------------------------------ |
 | Issuer   | `https://token.actions.githubusercontent.com`    |
 | Audience | `api://AzureADTokenExchange`                     |
-| Subject  | `repo:dcasati/gods-eye-view:ref:refs/heads/main` |
+| Subject  | `repo:dcasati@3240777/gods-eye-view@1387844308:ref:refs/heads/main` |
 
 Use this exact subject, not a wildcard and not an upstream or PR subject. No
 client secret or registry admin password is needed. Keep the ACR admin account
 disabled. The workflow does not use an environment subject.
+
+This fork has GitHub's **immutable OIDC subjects** enabled. The older
+`repo:owner/name:ref:refs/heads/main` form will not match. Verify the prefix
+without retrieving or printing a token:
+
+```bash
+gh api repos/dcasati/gods-eye-view/actions/oidc/customization/sub
+```
+
+Its `sub_claim_prefix` plus `:ref:refs/heads/main` must match the template's
+`githubOidcSubject`. For another repository, inspect its actual configuration
+and IDs; do not disable immutable subjects or widen trust to fix a mismatch.
 
 The template assigns **AcrPush** at this existing registry's resource scope
 only (not resource group or subscription scope). After reviewing deployment
@@ -150,7 +162,9 @@ ACR. Publication is not atomic across repositories: if one push succeeds but the
 second push, tag locking, or receipt creation fails, the workflow fails even
 though an image may exist:
 inspect that run's unique tag before using it. Fix the permission/transient error
-and rerun; never assume a failed run published a verified release.
+and **rerun all jobs**, or start a new run; never assume a failed run published
+a verified release. A publisher-only rerun deliberately fails because the
+attempt-specific build artifact and tag belong to the prior attempt.
 
 Local script checks (fixtures stay under the project and are removed):
 

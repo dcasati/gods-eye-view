@@ -275,3 +275,16 @@ esac
     /No AKS deployment was performed/,
   );
 });
+
+test('Azure federation matches the fork immutable OIDC subject and only main', () => {
+  const template = readFileSync(
+    new URL('../../infra/ci/identity.bicep', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    template,
+    /param githubOidcSubject string = 'repo:dcasati@3240777\/gods-eye-view@1387844308:ref:refs\/heads\/main'/,
+  );
+  assert.match(template, /subject: githubOidcSubject/);
+  assert.match(template, /scope: registry/);
+});

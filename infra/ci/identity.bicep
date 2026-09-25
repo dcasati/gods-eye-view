@@ -1,7 +1,8 @@
 param location string = resourceGroup().location
 param identityName string = 'id-gev-github-caldova'
 param registryName string = 'acrmiracaldova'
-param githubRepository string = 'dcasati/gods-eye-view'
+@description('Exact main-branch OIDC subject, including immutable IDs reported by GitHub for this fork.')
+param githubOidcSubject string = 'repo:dcasati@3240777/gods-eye-view@1387844308:ref:refs/heads/main'
 
 resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
   name: registryName
@@ -17,7 +18,7 @@ resource githubMain 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedI
   name: 'github-main'
   properties: {
     issuer: 'https://token.actions.githubusercontent.com'
-    subject: 'repo:${githubRepository}:ref:refs/heads/main'
+    subject: githubOidcSubject
     audiences: [
       'api://AzureADTokenExchange'
     ]
