@@ -10,12 +10,12 @@ on:
 permissions: {}
 
 concurrency:
-  group: acrmiracaldova-gods-eye-view
+  group: ${{ github.repository }}-acr-publication
   cancel-in-progress: false
 
 jobs:
   build:
-    if: github.repository == 'dcasati/gods-eye-view' && github.ref == 'refs/heads/main'
+    if: github.repository == vars.ACR_PUBLISH_REPOSITORY && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     permissions:
@@ -43,6 +43,7 @@ jobs:
           npm ci --no-audit --no-fund
           npm run check:boundaries
           node --test src/tooling/productionServer.test.mjs src/tooling/acr*.test.mjs \
+            src/tooling/deploymentDocs.test.mjs \
             src/overpassRegional*.test.mjs src/overpassProxy.test.mjs \
             src/data/overpassProxy.test.mjs src/sources/overpassFeatures.test.mjs \
             src/data/traffic*.test.mjs src/layers/traffic/navigation.test.mjs \
@@ -63,7 +64,7 @@ jobs:
 
   publish:
     needs: build
-    if: github.repository == 'dcasati/gods-eye-view' && github.ref == 'refs/heads/main'
+    if: github.repository == vars.ACR_PUBLISH_REPOSITORY && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -73,8 +74,9 @@ jobs:
       AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
       AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      ACR_NAME: acrmiracaldova
-      ACR_LOGIN_SERVER: acrmiracaldova.azurecr.io
+      PUBLISH_REPOSITORY: ${{ vars.ACR_PUBLISH_REPOSITORY }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
       IMAGE_NAME: gods-eye-view
       IMAGE_TAG: ${{ needs.build.outputs.tag }}
       DOWNSTREAM_SHA: ${{ needs.build.outputs.downstream }}
@@ -111,4 +113,4 @@ jobs:
           if-no-files-found: error
       - name: Remove registry credentials
         if: always()
-        run: docker logout acrmiracaldova.azurecr.io
+        run: docker logout "$ACR_LOGIN_SERVER"

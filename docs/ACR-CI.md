@@ -1,174 +1,258 @@
-# Latest upstream → tested image → ACR
+# Publish God's Eye View Images to ACR with GitHub Actions
 
-The downstream workflow [acr-image.yml](../.github/workflows/acr-image.yml)
-publishes **only** these two repositories:
+This guide configures a fork of God's Eye View to build the latest upstream source,
+retain the fork's deployment changes, and publish container images to Azure
+Container Registry (ACR). GitHub authenticates to Azure through OpenID Connect
+(OIDC), without an Azure client secret or registry password.
 
-- `acrmiracaldova.azurecr.io/gods-eye-view` — production application.
-- `acrmiracaldova.azurecr.io/overpass-austin` — regional roads backend,
-  built from the dedicated `infra/overpass` context.
+The workflow is reusable: repository authorization, registry settings, and Azure
+identity IDs are Actions variables. It is **disabled until you explicitly select
+the repository allowed to publish**.
 
-It runs on every
-downstream `main` push, manually, and daily at 07:23 UTC. GitHub schedules are
-best-effort and can be delayed; fork schedules must be explicitly enabled.
-It does **not** deploy to AKS or need any cluster permissions.
+## Architecture Overview
 
-## Source and credential boundaries
+| Stage           | What happens                                                                                                      |
+| --------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Source assembly | Check out the fork commit and merge current `bilawalsidhu/gods-eye-view` upstream `main`. Conflicts fail the run. |
+| Build           | Run regression tests and build Linux amd64 application and regional-example images without Azure credentials.     |
+| Transfer        | Upload tested image data as an artifact for a separate publisher runner.                                          |
+| Publish         | Acquire a short-lived OIDC login, push both images, lock their version tags, and retain digest receipts.          |
 
-1. Check out the exact downstream commit for this run, including its Dockerfile,
-   production server, and downstream fixes.
-2. Fetch `main` from the fixed canonical URL
-   `https://github.com/bilawalsidhu/gods-eye-view.git` and perform a normal Git
-   merge into the downstream working tree. The latest source means the upstream
-   SHA observed at fetch time. Nothing is pushed to either source repository.
-3. Conflicts deliberately **fail** the run, rather than overwriting downstream
-   fixes. Resolve the canonical upstream merge in a reviewed downstream change
-   and merge it to `main`, then rerun. Do not resolve by blindly taking upstream.
-4. Install locked dependencies, run production-server, CI, regional Overpass,
-   proxy, and traffic/navigation regression tests, and build both Linux amd64
-   containers. The application Dockerfile performs the production build. Docker
-   secret exclusions must remain present in `.dockerignore`. The Overpass image
-   uses its dedicated context allowlist, with no provider credentials or regional
-   OSM database built into the image; database import is a separate runtime task.
-   Its Dockerfile self-test imports synthetic XML and checks an actual road query
-   and source timestamp as UID 1000, then removes the test database.
-   Both images are rebuilt on every run, including changes under `infra/overpass`,
-   so they share one tested source snapshot.
-5. Transfer the images as a same-run artifact to a fresh publisher runner.
-   Only the publisher has OIDC permission; it checks out the original downstream
-   commit for its publication scripts, not the merged upstream scripts. It
-   loads the images as data and never runs them, npm, or upstream build scripts.
-6. Validate repository, branch, event, Azure variable UUIDs, registry, image,
-   source labels and unique tag before publication. Acquire short-lived Azure
-   credentials, push both images, and lock their unique tags against writes and
-   deletion.
+The build job has only `contents: read`. The publisher has `contents: read` and
+`id-token: write`; it never executes the transferred images or upstream build
+scripts. Its scripts come from the original fork commit.
 
-This intentionally trusts canonical upstream application/dependency code as a
-software supply-chain input. It does not prove that new upstream code is benign.
-Review upstream changes and restrict/protect downstream `main` and workflow
-changes. Build runners never receive Azure credentials or OIDC permission.
-No provider API keys, dotenv values, or Kubernetes credentials belong in this
-workflow's secrets, variables, build arguments, artifacts, or image. Provider
-configuration is supplied only at runtime, as documented in [AKS.md](AKS.md).
-The publisher has only `contents: read` and `id-token: write`; all other jobs have
-no write permissions. There are no PR publication triggers.
+The workflow publishes `gods-eye-view` and `overpass-austin` repositories inside
+your ACR. The latter is an **optional Austin-only example**, not a global road
+service; building it does not download a regional database or deploy it.
 
-## One-time Azure and GitHub setup
+## Prerequisites
 
-An Azure administrator provisions the dedicated user-assigned managed identity
-`id-gev-github-caldova` using [identity.bicep](../infra/ci/identity.bicep).
-The template creates only the identity, its GitHub federated identity credential,
-and registry-scoped `AcrPush` assignment; it does not deploy the application or
-grant cluster rights. The provisioning operator needs permission to create the
-identity/federation and assign a role at the registry. These provisioning rights
-are not granted to the workflow identity.
+- A fork containing `.github/workflows/acr-image.yml`, the Dockerfiles, and the
+  production-server changes on `main`.
+- GitHub CLI authenticated with permission to configure that fork's variables
+  and workflows.
+- Azure CLI with Bicep, authenticated to the intended subscription.
+- An existing ACR using **RBAC Registry Permissions** and accessible from the
+  chosen GitHub runner.
+- Permission to create a managed identity and federated credential, and assign
+  `AcrPush` at the registry.
 
-The credential has these exact settings:
+For registry and cluster creation, see [God's Eye View on AKS](AKS.md).
+This guide uses Azure public cloud. An ABAC-enabled registry needs a different,
+appropriately scoped repository-writer role; the included Bicep uses `AcrPush`.
+Do not change registry authorization modes or grant subscription-wide roles just
+to bypass an access error.
 
-| Field    | Required value                                   |
-| -------- | ------------------------------------------------ |
-| Issuer   | `https://token.actions.githubusercontent.com`    |
-| Audience | `api://AzureADTokenExchange`                     |
-| Subject  | `repo:dcasati@3240777/gods-eye-view@1387844308:ref:refs/heads/main` |
+## Configuration
 
-Use this exact subject, not a wildcard and not an upstream or PR subject. No
-client secret or registry admin password is needed. Keep the ACR admin account
-disabled. The workflow does not use an environment subject.
-
-This fork has GitHub's **immutable OIDC subjects** enabled. The older
-`repo:owner/name:ref:refs/heads/main` form will not match. Verify the prefix
-without retrieving or printing a token:
+Run commands from your checkout's root. Set your own values:
 
 ```bash
-gh api repos/dcasati/gods-eye-view/actions/oidc/customization/sub
-```
+set -euo pipefail
+export GITHUB_REPOSITORY="<owner>/<fork>"
+export AZURE_SUBSCRIPTION_ID="<subscription-id>"
+export RESOURCE_GROUP="<resource-group-containing-your-registry>"
+export ACR_NAME="<registry-name>"
+export IDENTITY_NAME="id-gods-eye-view-github"
+export DEPLOYMENT_NAME="gods-eye-view-github-identity"
 
-Its `sub_claim_prefix` plus `:ref:refs/heads/main` must match the template's
-`githubOidcSubject`. For another repository, inspect its actual configuration
-and IDs; do not disable immutable subjects or widen trust to fix a mismatch.
-
-The template assigns **AcrPush** at this existing registry's resource scope
-only (not resource group or subscription scope). After reviewing deployment
-validation and what-if output, an administrator signed in to the intended
-subscription runs:
-
-```bash
-az deployment group create \
-  --resource-group rg-mira-caldova \
-  --template-file infra/ci/identity.bicep \
-  --name gev-github-identity
-```
-
-The registry must use the RBAC registry permission mode that supports `AcrPush`.
-If it uses RBAC + ABAC repository permissions, stop and arrange the appropriate
-repository-scoped writer role with the administrator; do not grant broad
-subscription permissions to work around authentication failures. The workflow
-also requires registry network access from GitHub-hosted runners.
-
-Configure three **repository Actions variables**, not provider secrets, directly
-from the deployment outputs `clientId`, `tenantId`, and `subscriptionId`:
-
-```bash
-gh variable set AZURE_CLIENT_ID --repo dcasati/gods-eye-view --body "$(
-  az deployment group show --resource-group rg-mira-caldova \
-    --name gev-github-identity --query properties.outputs.clientId.value --output tsv
+az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+GITHUB_REPOSITORY="$(gh repo view "$GITHUB_REPOSITORY" \
+  --json nameWithOwner --jq .nameWithOwner)"
+export GITHUB_REPOSITORY
+ACR_LOGIN_SERVER="$(
+  az acr show --name "$ACR_NAME" --query loginServer --output tsv
 )"
-gh variable set AZURE_TENANT_ID --repo dcasati/gods-eye-view --body "$(
-  az deployment group show --resource-group rg-mira-caldova \
-    --name gev-github-identity --query properties.outputs.tenantId.value --output tsv
-)"
-gh variable set AZURE_SUBSCRIPTION_ID --repo dcasati/gods-eye-view --body "$(
-  az deployment group show --resource-group rg-mira-caldova \
-    --name gev-github-identity --query properties.outputs.subscriptionId.value --output tsv
-)"
+export ACR_LOGIN_SERVER
+mkdir -p .azure
 ```
 
-After the workflow and downstream container changes are committed on fork `main`,
-enable Actions in the fork if GitHub has disabled them, then:
+The template deploys the identity into the registry's resource group. Identity
+names and OIDC subjects are configurable; no operator-specific IDs are embedded.
+Keep local parameters and verification records under the Git-ignored `.azure/`.
+
+## Configure the GitHub OIDC Trust
+
+1. Read the fork's OIDC configuration without requesting or printing a token:
+
+   ```bash
+   gh api "repos/${GITHUB_REPOSITORY}/actions/oidc/customization/sub" \
+     > .azure/github-oidc.json
+   ```
+
+2. Derive the exact `main` subject from the default configuration:
+
+   ```bash
+   GITHUB_OIDC_SUBJECT="$(
+     python3 - <<'PY'
+   import json, os
+   from pathlib import Path
+   config = json.loads(Path(".azure/github-oidc.json").read_text())
+   if config.get("use_default") is not True:
+       raise SystemExit("Custom OIDC template: inspect its claims and supply the exact main subject")
+   if config.get("use_immutable_subject"):
+       prefix = config.get("sub_claim_prefix")
+       if not prefix:
+           raise SystemExit("Immutable subject prefix is missing; do not guess it")
+   else:
+       prefix = "repo:" + os.environ["GITHUB_REPOSITORY"]
+   print(prefix + ":ref:refs/heads/main")
+   PY
+   )"
+   export GITHUB_OIDC_SUBJECT
+   ```
+
+   An immutable subject contains repository and owner IDs. A legacy subject uses
+   `repo:OWNER/REPOSITORY:ref:refs/heads/main`. They are **not interchangeable**.
+   For a custom subject template, review its exact claims instead of running the
+   default derivation. Never disable immutable subjects or add wildcard trust to
+   make an incorrect credential match.
+
+3. Review the [identity template](../infra/ci/identity.bicep). It creates a
+   dedicated user-assigned managed identity, one GitHub federated credential,
+   and one registry-scoped `AcrPush` assignment. Issuer and audience are:
+
+   | Setting  | Value                                           |
+   | -------- | ----------------------------------------------- |
+   | Issuer   | `https://token.actions.githubusercontent.com`   |
+   | Audience | `api://AzureADTokenExchange`                    |
+   | Subject  | Your verified repository's exact `main` subject |
+
+4. Validate and preview the change before provisioning:
+
+   ```bash
+   az deployment group validate \
+     --resource-group "$RESOURCE_GROUP" \
+     --template-file infra/ci/identity.bicep \
+     --parameters identityName="$IDENTITY_NAME" registryName="$ACR_NAME" \
+       githubOidcSubject="$GITHUB_OIDC_SUBJECT"
+
+   az deployment group what-if \
+     --resource-group "$RESOURCE_GROUP" \
+     --template-file infra/ci/identity.bicep \
+     --parameters identityName="$IDENTITY_NAME" registryName="$ACR_NAME" \
+       githubOidcSubject="$GITHUB_OIDC_SUBJECT"
+   ```
+
+5. After reviewing the proposed scope, deploy:
+
+   ```bash
+   az deployment group create \
+     --resource-group "$RESOURCE_GROUP" \
+     --name "$DEPLOYMENT_NAME" \
+     --template-file infra/ci/identity.bicep \
+     --parameters identityName="$IDENTITY_NAME" registryName="$ACR_NAME" \
+       githubOidcSubject="$GITHUB_OIDC_SUBJECT"
+   ```
+
+The workflow identity does not receive the provisioning operator's rights.
+It has no AKS, subscription-wide, or provider-secret access.
+
+## Set Repository Variables
+
+Read the non-secret identity outputs:
 
 ```bash
-gh workflow enable acr-image.yml --repo dcasati/gods-eye-view
-gh workflow run acr-image.yml --repo dcasati/gods-eye-view --ref main
-gh run list --repo dcasati/gods-eye-view --workflow acr-image.yml --limit 5
-gh run watch '<run-id>' --repo dcasati/gods-eye-view --exit-status
-gh run download '<run-id>' --repo dcasati/gods-eye-view \
-  --name 'publication-<run-id>-<attempt>' --dir ./publication-receipt
+AZURE_CLIENT_ID="$(az deployment group show \
+  --resource-group "$RESOURCE_GROUP" --name "$DEPLOYMENT_NAME" \
+  --query properties.outputs.clientId.value --output tsv)"
+AZURE_TENANT_ID="$(az deployment group show \
+  --resource-group "$RESOURCE_GROUP" --name "$DEPLOYMENT_NAME" \
+  --query properties.outputs.tenantId.value --output tsv)"
 ```
 
-Enable only `acr-image.yml`; do not bulk-enable unrelated inherited workflows.
-New workflow files may not appear in the fork's Actions API until the commit is
-present on its default branch, `main`.
-
-Official action commits are pinned. Updating them requires verifying the commit
-against each official action repository, not merely accepting a mutable tag.
-Repository permissions should restrict who can change Actions variables and
-merge workflow or publication-script changes.
-
-## Image identity and failures
-
-Version tags use `run-<run-id>-<attempt>-<downstream-short-sha>-<upstream-short-sha>`.
-Each retry gets a new tag. A successful run locks its tag; no mutable `latest`
-tag is published. The labels `org.opencontainers.image.revision` and
-`io.gods-eye-view.upstream.revision` record the full downstream and upstream SHAs.
-Workflow concurrency prevents overlapping publication runs (GitHub can replace
-older pending runs with newer ones).
-
-The Actions summary and the 90-day `publication-<run-id>-<attempt>` artifact record
-both SHAs, the immutable digest, the image tag, and a digest pull reference.
-The artifact contains `publication.json` for the application and
-`publication-overpass.json` for the regional backend. Both use the same unique
-tag but have independent digests. Use each digest for a separately authorized
-deployment. Image transfer artifacts expire after one day; the images stay in
-ACR. Publication is not atomic across repositories: if one push succeeds but the
-second push, tag locking, or receipt creation fails, the workflow fails even
-though an image may exist:
-inspect that run's unique tag before using it. Fix the permission/transient error
-and **rerun all jobs**, or start a new run; never assume a failed run published
-a verified release. A publisher-only rerun deliberately fails because the
-attempt-specific build artifact and tag belong to the prior attempt.
-
-Local script checks (fixtures stay under the project and are removed):
+Set these **Actions variables**, not provider secrets:
 
 ```bash
-bash -n scripts/ci/*.sh
-node --test src/tooling/acr*.test.mjs
+gh variable set AZURE_CLIENT_ID --repo "$GITHUB_REPOSITORY" --body "$AZURE_CLIENT_ID"
+gh variable set AZURE_TENANT_ID --repo "$GITHUB_REPOSITORY" --body "$AZURE_TENANT_ID"
+gh variable set AZURE_SUBSCRIPTION_ID --repo "$GITHUB_REPOSITORY" --body "$AZURE_SUBSCRIPTION_ID"
+gh variable set ACR_NAME --repo "$GITHUB_REPOSITORY" --body "$ACR_NAME"
+gh variable set ACR_LOGIN_SERVER --repo "$GITHUB_REPOSITORY" --body "$ACR_LOGIN_SERVER"
+gh variable set ACR_PUBLISH_REPOSITORY --repo "$GITHUB_REPOSITORY" --body "$GITHUB_REPOSITORY"
 ```
+
+| Variable                 | Purpose                                                                             |
+| ------------------------ | ----------------------------------------------------------------------------------- |
+| `AZURE_CLIENT_ID`        | Dedicated managed identity's client ID.                                             |
+| `AZURE_TENANT_ID`        | Identity's Microsoft Entra tenant.                                                  |
+| `AZURE_SUBSCRIPTION_ID`  | Subscription containing the registry and identity.                                  |
+| `ACR_NAME`               | Target registry resource name.                                                      |
+| `ACR_LOGIN_SERVER`       | Actual login server returned by Azure, including any generated DNS suffix.          |
+| `ACR_PUBLISH_REPOSITORY` | Exact allowed `owner/repository`; empty or mismatched values skip publication jobs. |
+
+Do not place API keys, kubeconfigs, Azure passwords, or registry credentials in
+this workflow. API keys are supplied at runtime through Kubernetes Secrets.
+
+## Run and Verify the Pipeline
+
+Enable only this workflow after its files are on your fork's `main`:
+
+```bash
+gh workflow enable acr-image.yml --repo "$GITHUB_REPOSITORY"
+gh workflow run acr-image.yml --repo "$GITHUB_REPOSITORY" --ref main
+gh run list --repo "$GITHUB_REPOSITORY" --workflow acr-image.yml --limit 5
+```
+
+Select the resulting run ID:
+
+```bash
+export RUN_ID="<run-id>"
+gh run watch "$RUN_ID" --repo "$GITHUB_REPOSITORY" --exit-status
+ATTEMPT="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq .run_attempt)"
+gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+  --name "publication-${RUN_ID}-${ATTEMPT}" \
+  --dir ".azure/publication-${RUN_ID}-${ATTEMPT}"
+```
+
+Expected result: both `build` and `publish` succeed. The receipt files are
+`publication.json` and `publication-overpass.json`, containing both source SHAs,
+the image tag, digest, and digest pull reference. Use those digests in your
+local AKS overlay; publication does not update the cluster.
+
+## What the Workflow Does
+
+1. Runs on allowed `main` pushes, manual dispatch, and daily at 07:23 UTC.
+   GitHub schedules are best-effort and fork schedules can require enabling.
+2. Fetches the fixed canonical upstream URL and merges current `main` into the
+   fork checkout. It does not push to either repository.
+3. Fails on merge conflicts or missing Docker secret exclusions rather than
+   silently dropping downstream changes.
+4. Tests and builds both amd64 images, then transfers them to an isolated
+   publisher with no upstream build code executing there.
+5. Validates the configured repository, branch, registry, Azure IDs, source labels,
+   and unique run tag before using OIDC.
+6. Publishes `run-RUNID-ATTEMPT-DOWNSTREAMSHA-UPSTREAMSHA` tags and locks them against
+   writes and deletion. No mutable `latest` tag is published.
+7. Keeps image-transfer artifacts for one day and publication receipts for 90
+   days. Registry images remain until managed through your retention process.
+
+## Troubleshooting
+
+| Symptom                              | Check                                                                                                                              |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Jobs are skipped                     | `ACR_PUBLISH_REPOSITORY` exactly matches the current repository, and the run is on `main`.                                         |
+| Source merge fails                   | Resolve upstream conflicts in a reviewed fork commit; never blindly overwrite the deployment fixes.                                |
+| `AADSTS700213`                       | Compare the reported assertion subject with the exact federated credential, including immutable IDs, issuer, audience, and branch. |
+| Registry authorization fails         | Verify registry-scoped `AcrPush`, permission mode, and propagation. Do not grant broader subscription roles.                       |
+| Registry is network-restricted       | Use an approved runner with network access. Do not disable registry protections as a workaround.                                   |
+| A rerun cannot find its artifact/tag | Rerun **all jobs** or dispatch a new run. Publisher-only reruns intentionally reject a prior attempt's artifact/tag.               |
+| One image exists after a failed run  | Publication is not atomic across repositories. Inspect the run's unique tags; do not treat a failed run as a verified release.     |
+
+## Security and Production Considerations
+
+| Area           | Recommendation                                                                                                                   |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Trust boundary | Protect `main`, workflow changes, and Actions variables. Trust only the exact intended repository/branch in Azure.               |
+| Supply chain   | Canonical upstream and its dependencies are software inputs, not automatically trusted proof of safety. Review upstream changes. |
+| Actions        | Official action commits are pinned. Verify updates against the official action repositories.                                     |
+| Permissions    | Keep the builder without OIDC and the publisher without AKS rights. Keep ACR admin credentials disabled.                         |
+| Cost           | Daily builds and locked image tags consume runner time and registry storage. Establish a reviewed retention process.             |
+
+## References
+
+- [GitHub OIDC with Azure](https://docs.github.com/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-azure)
+- [GitHub OIDC subject configuration API](https://docs.github.com/rest/actions/oidc)
+- [Azure managed identity federation](https://learn.microsoft.com/entra/workload-id/workload-identity-federation)
+- [Private AKS deployment](AKS.md)

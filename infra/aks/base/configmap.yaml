@@ -20,5 +20,3 @@ data:
   VITE_AIS_LIVE_MAX_ROWS: "12000"
   VITE_AIS_LIVE_LABEL_MAX_ROWS: "900"
   TOMTOM_DAILY_TILE_BUDGET: "6000"
-  OVERPASS_REGIONAL_URL: http://overpass-austin.gods-eye-view.svc.cluster.local/api/interpreter
-  OVERPASS_REGIONAL_BOUNDS: "29.9,-98.2,30.7,-97.2"

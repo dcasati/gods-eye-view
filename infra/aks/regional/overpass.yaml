@@ -43,7 +43,7 @@ spec:
           type: RuntimeDefault
       initContainers:
         - name: import
-          image: acrmiracaldova.azurecr.io/overpass-austin:PLACEHOLDER
+          image: overpass-austin:PLACEHOLDER
           args: ['/opt/regional/bootstrap.py']
           resources:
             requests:
@@ -62,7 +62,7 @@ spec:
               mountPath: /db
       containers:
         - name: overpass
-          image: acrmiracaldova.azurecr.io/overpass-austin:PLACEHOLDER
+          image: overpass-austin:PLACEHOLDER
           ports:
             - name: http
               containerPort: 8080

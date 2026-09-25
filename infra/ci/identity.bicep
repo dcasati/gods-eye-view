@@ -1,8 +1,10 @@
 param location string = resourceGroup().location
-param identityName string = 'id-gev-github-caldova'
-param registryName string = 'acrmiracaldova'
-@description('Exact main-branch OIDC subject, including immutable IDs reported by GitHub for this fork.')
-param githubOidcSubject string = 'repo:dcasati@3240777/gods-eye-view@1387844308:ref:refs/heads/main'
+param identityName string = 'id-gods-eye-view-github'
+@minLength(5)
+param registryName string
+@minLength(1)
+@description('Exact main-branch OIDC subject obtained from the target repository, including immutable IDs when enabled.')
+param githubOidcSubject string
 
 resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
   name: registryName

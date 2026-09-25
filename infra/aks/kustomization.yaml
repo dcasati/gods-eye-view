@@ -1,16 +1,4 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-namespace: gods-eye-view
-images:
-  - name: acrmiracaldova.azurecr.io/gods-eye-view
-    digest: sha256:831dc0d1476223bd6201604253677b543d8ea5a29c129193e296967be6c483d5
-  - name: acrmiracaldova.azurecr.io/overpass-austin
-    digest: sha256:8e3107dfc0ba9a62f793833f6873a753ff512edc019f843e89c2a97c03ec64ee
 resources:
-  - namespace.yaml
-  - configmap.yaml
-  - deployment.yaml
-  - service.yaml
-  - networkpolicy.yaml
-  - cache-pvc.yaml
-  - overpass-regional.yaml
+  - base

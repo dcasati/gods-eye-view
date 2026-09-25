@@ -1,523 +1,477 @@
-# Private deployment on the existing AKS cluster
+# God's Eye View on AKS with Private Access
 
-Target **only** Kubernetes context `aks-mira-caldova`, namespace
-`gods-eye-view`, and the existing ACR `acrmiracaldova`. These artifacts do not
-create a cluster, registry, ingress, load balancer, public IP, DNS record, or
-Azure role assignment. The Service is **ClusterIP**, port **80 → 4173**.
-Access is through an authorized, **localhost-only port-forward**.
+This guide deploys God's Eye View to Azure Kubernetes Service (AKS). The application
+uses a `ClusterIP` service and is accessed through `kubectl port-forward`, without
+an application ingress, public load balancer, or public hostname.
 
-The production container runs `node server/standalone/production.mjs` (also
-available as `npm start`), serving built `dist/` and same-origin provider APIs.
-This is not Vite's development server or `vite preview`. `GET /healthz` and
-`GET /readyz` are local process/readiness checks, not guarantees that every
-external provider is available.
+You can create a cluster and Azure Container Registry (ACR), or use existing
+resources. Resource names, image digests, and cluster credentials stay in your
+local configuration rather than in the shared manifests.
 
-## Preconditions
+## Architecture Overview
 
-- Run commands from the repository root, using Bash, `kubectl`, Azure CLI, and
-  Python 3. `kubectl kustomize` is sufficient; standalone Kustomize is not needed.
-- Existing Azure authentication must be authorized for this ACR and its remote
-  builds. Confirm the intended subscription independently before running Azure
-  commands; Kubernetes context selection does **not** select an Azure subscription.
-  Stop on authorization errors rather than changing accounts or cluster targets.
-- Context `aks-mira-caldova` must already exist and be authorized for namespace,
-  workload, Secret, and port-forward operations. Every Kubernetes command below
-  specifies it explicitly; do not change the global current context.
-- AKS nodes must already be able to pull from `acrmiracaldova.azurecr.io` using
-  their existing identity and network path. This guide does not enable ACR admin
-  credentials, create registry passwords, or modify AKS/ACR permissions.
-- The image is built for **linux/amd64**; the cluster must have matching nodes.
-  Namespace admission must allow the restricted pod specification.
-- Application API credentials are optional and belong only in the
-  `gods-eye-view-secrets` Kubernetes Secret. Never put them in Git, ConfigMap,
-  image layers, build arguments, build logs, or the build context.
+| Component                  | Purpose                                                                                                   |
+| -------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Production application     | Node.js serves the built browser application and same-origin provider APIs.                               |
+| Kubernetes Secret          | Holds provider API keys at runtime, never at image build time.                                            |
+| ConfigMap                  | Holds non-sensitive application and provider settings.                                                    |
+| Persistent cache           | Retains provider responses when the application pod is replaced.                                          |
+| Optional regional Overpass | Provides a bounded, roads-only OpenStreetMap snapshot. The included example covers Austin, not the world. |
+| AKS kubelet identity       | Pulls images from ACR using `AcrPull`, without a registry password.                                       |
 
-ACR remote build does not need a local Docker daemon, but does need working
-Azure authorization. `infra/aks/kustomization.yaml` pins the published image
-digest. Deployment history and verification evidence are recorded in
-`.azure/deployment-plan.md`.
+The [GitHub Actions pipeline](ACR-CI.md) can build and publish images separately.
+It does not deploy to AKS or receive cluster credentials.
 
-## 1. Build a credential-free image remotely
+## Prerequisites
 
-Use a clean, reviewed checkout containing the production Dockerfile,
-`.dockerignore`, and application changes. Keep the credentials env file **outside
-this checkout**. Confirm `.dockerignore` excludes local `.env` files, private
-credentials, caches, logs, and other local artifacts. Do not upload an existing
-working directory containing arbitrary credential files, even if they are
-Git-ignored: Docker/ACR build context filtering uses `.dockerignore`, not
-`.gitignore`. No API keys are required at build time.
+- An Azure subscription with quota for the selected region and VM size.
+- Azure CLI, `kubectl`, Git, Python 3.9 or later, and Bash.
+- Permission to create resources and assign roles for a new cluster, or
+  appropriate access to an existing cluster and registry.
+- An amd64 Linux node pool and the Azure Disk CSI `managed-csi` storage class.
+- A checkout containing the Dockerfiles and manifests in this repository.
 
-Use a unique tag, never `latest`. Record its immutable digest after the build:
+Run commands from the repository root. These examples target Azure public cloud
+and an ACR using **RBAC Registry Permissions**, not ABAC repository permissions.
+No Istio, ingress controller, or Helm installation is needed.
+
+> Creating a cluster incurs charges for nodes, storage, and associated Azure
+> resources. The configuration below is a starting point for a small deployment,
+> not an availability or cost guarantee.
+
+## Configuration
+
+Set these values before running the commands. Replace values in angle brackets;
+the other names are application defaults that you can change.
 
 ```bash
 set -euo pipefail
-IMAGE_TAG="aks-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
+export AZURE_SUBSCRIPTION_ID="<subscription-id>"
+export LOCATION="eastus2"
+export RESOURCE_GROUP="rg-gods-eye-view"
+export CLUSTER_NAME="aks-gods-eye-view"
+export ACR_NAME="<globally-unique-registry-name>"
+export NAMESPACE="gods-eye-view"
+export NODE_VM_SIZE="Standard_D4s_v5"
+export ADMIN_IP_CIDR="<your-workstation-public-ip>/32"
+export USE_AUSTIN_EXAMPLE="false"
+export AKS_OVERLAY_DIR=".azure/aks"
+```
+
+| Variable                            | Purpose                                                            |
+| ----------------------------------- | ------------------------------------------------------------------ |
+| `AZURE_SUBSCRIPTION_ID`, `LOCATION` | Subscription and supported Azure region.                           |
+| `RESOURCE_GROUP`                    | Resource group used by this walkthrough.                           |
+| `CLUSTER_NAME`                      | New or existing AKS cluster.                                       |
+| `ACR_NAME`                          | Registry name: globally unique, 5–50 lowercase letters and digits. |
+| `NAMESPACE`                         | Dedicated application namespace, not a shared workload namespace.  |
+| `NODE_VM_SIZE`                      | Available amd64 VM size with adequate CPU and memory.              |
+| `ADMIN_IP_CIDR`                     | Public egress IP allowed to reach a newly created AKS API server.  |
+| `USE_AUSTIN_EXAMPLE`                | Explicitly opt into the additional Austin database and workload.   |
+| `AKS_OVERLAY_DIR`                   | Untracked deployment configuration beneath `.azure/`.              |
+
+## Create the Registry and AKS Cluster
+
+Skip this section when using existing resources. Do not run these commands merely
+to adapt a shared cluster to the example.
+
+1. Authenticate and select the subscription:
+
+   ```bash
+   az login
+   az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+   az account show --query '{name:name,id:id}' --output table
+   ```
+
+2. Create the resource group and registry:
+
+   ```bash
+   az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+   az acr create \
+     --resource-group "$RESOURCE_GROUP" \
+     --name "$ACR_NAME" \
+     --sku Basic \
+     --role-assignment-mode rbac \
+     --admin-enabled false
+
+   ACR_ID="$(az acr show --name "$ACR_NAME" --query id --output tsv)"
+   ```
+
+3. Create a two-node cluster with managed identity and Azure CNI Overlay powered
+   by Cilium. Cilium enforces the included NetworkPolicies:
+
+   ```bash
+   az aks create \
+     --resource-group "$RESOURCE_GROUP" \
+     --name "$CLUSTER_NAME" \
+     --location "$LOCATION" \
+     --node-count 2 \
+     --node-vm-size "$NODE_VM_SIZE" \
+     --enable-managed-identity \
+     --network-plugin azure \
+     --network-plugin-mode overlay \
+     --network-dataplane cilium \
+     --api-server-authorized-ip-ranges "$ADMIN_IP_CIDR" \
+     --attach-acr "$ACR_ID" \
+     --generate-ssh-keys
+   ```
+
+   `--attach-acr` grants the kubelet identity registry-scoped `AcrPull`. It
+   requires role-assignment permission. ABAC-enabled registries need the
+   appropriate repository-reader role instead; do not change an existing
+   registry's permission mode to work around an authorization error.
+
+   The application remains private. The AKS API server is a separate endpoint:
+   this example restricts its public access to your specified IP. Use a private
+   AKS cluster when your workstation has the required private network and DNS
+   access. AKS can also create public outbound networking resources; those are
+   not application ingress.
+
+## Connect to a New or Existing Cluster
+
+For existing resources, set the configuration variables to their actual values
+and confirm the kubelet already has permission to pull from your registry.
+Do not change another workload's networking or identity settings.
+
+```bash
+az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+mkdir -p .azure
+export KUBECONFIG="${PWD}/.azure/cluster.config"
+az aks get-credentials \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$CLUSTER_NAME" \
+  --file "$KUBECONFIG" \
+  --overwrite-existing
+export KUBE_CONTEXT="$CLUSTER_NAME"
+ACR_LOGIN_SERVER="$(
+  az acr show --name "$ACR_NAME" --query loginServer --output tsv
+)"
+export ACR_LOGIN_SERVER
+
+kubectl --context "$KUBE_CONTEXT" get nodes
+kubectl --context "$KUBE_CONTEXT" get storageclass managed-csi
+```
+
+If you already use another kubeconfig or a renamed context, retain that
+`KUBECONFIG` and set `KUBE_CONTEXT` accordingly instead of downloading credentials.
+`.azure/` is Git-ignored. Never commit or share its kubeconfig or local settings.
+
+## Build the Container Images
+
+The recommended repeatable path is [Publish Images to ACR with GitHub Actions](ACR-CI.md).
+Use the application digest from its publication receipt as `APP_IMAGE_DIGEST`.
+If using the Austin example, also set `REGIONAL_IMAGE_DIGEST` from that receipt.
+
+Alternatively, build remotely in ACR without a local Docker daemon:
+
+```bash
+TAG="local-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
 az acr build \
-  --subscription 6ab9178f-09bc-45be-ba47-f682147eb1f0 \
-  --registry acrmiracaldova \
-  --platform linux/amd64 \
-  --file Dockerfile \
-  --image "gods-eye-view:${IMAGE_TAG}" \
-  .
+  --registry "$ACR_NAME" --platform linux/amd64 \
+  --file Dockerfile --image "gods-eye-view:${TAG}" .
+APP_IMAGE_DIGEST="$(
+  az acr repository show --name "$ACR_NAME" \
+    --image "gods-eye-view:${TAG}" --query digest --output tsv
+)"
+export APP_IMAGE_DIGEST
 
-IMAGE_DIGEST="$(az acr repository show \
-  --subscription 6ab9178f-09bc-45be-ba47-f682147eb1f0 \
-  --name acrmiracaldova \
-  --image "gods-eye-view:${IMAGE_TAG}" \
-  --query digest --output tsv)"
-[[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || {
-  echo "Expected an ACR image digest; refusing deployment." >&2
-  exit 1
-}
-IMAGE_REF="acrmiracaldova.azurecr.io/gods-eye-view@${IMAGE_DIGEST}"
-```
-
-Keep `IMAGE_REF` for subsequent applies and rollback. The base Deployment has
-an intentionally unusable `:PLACEHOLDER` image, replaced by the digest in
-`kustomization.yaml`. Apply the complete Kustomize directory, not the base
-Deployment by itself. When updating, also update that recorded digest.
-
-## 2. Create the namespace and supply optional credentials
-
-```bash
-kubectl --context aks-mira-caldova apply -f infra/aks/namespace.yaml
-```
-
-The initial launch is **keyless**: do not read an original checkout's `.env` or
-other credential files without explicit consent. For this new namespace, create
-an empty Secret **only if absent**, using `create`, never `apply` or `replace`:
-
-```bash
-set -euo pipefail
-EXISTING_SECRET="$(kubectl --context aks-mira-caldova --namespace gods-eye-view \
-  get secret gods-eye-view-secrets --ignore-not-found -o name)"
-if [[ -z "$EXISTING_SECRET" ]]; then
-  kubectl --context aks-mira-caldova --namespace gods-eye-view \
-    create secret generic gods-eye-view-secrets
-else
-  echo "Existing Secret preserved; review before deployment if keyless operation is required."
+if [ "$USE_AUSTIN_EXAMPLE" = "true" ]; then
+  az acr build \
+    --registry "$ACR_NAME" --platform linux/amd64 \
+    --file infra/overpass/Dockerfile \
+    --image "overpass-austin:${TAG}" infra/overpass
+  REGIONAL_IMAGE_DIGEST="$(
+    az acr repository show --name "$ACR_NAME" \
+      --image "overpass-austin:${TAG}" --query digest --output tsv
+  )"
+  export REGIONAL_IMAGE_DIGEST
 fi
 ```
 
-The lookup prints only the resource name, never its data. Lookup errors stop the
-script. If another operator creates the Secret between lookup and creation,
-`create` fails safely rather than overwriting it. Never apply an empty Secret or
-a manifest containing blank example credentials over an existing Secret.
+Build from a reviewed checkout. Keep credential files outside it: Docker uses
+`.dockerignore`, not `.gitignore`, to filter uploads. Never pass provider keys as
+build arguments. Both images are credential-free; the regional image does not
+contain a downloaded OSM database.
 
-The Deployment's `secretRef` is explicitly **optional** (`optional: true`):
-an absent or empty Secret permits keyless startup, while an existing populated
-Secret supplies its credentials. Existing credentials are not erased to force
-keyless mode; stop for review if an existing Secret's intended use is unclear.
+## Create Your Local Deployment Configuration
 
-To enable providers, use a user-selected, owner-readable env file outside the
-checkout with only the credential names needed, in `NAME=value` format (no shell
-`export`, expansion, or surrounding shell quotes). Refer to `.env.example` for
-descriptions, but **do not use that entire file as a Secret**: non-secret settings
-belong in the ConfigMap. Supported credential names include:
+The base at `infra/aks` deploys only the application and its cache. The alternative
+base at `infra/aks/regional` also deploys the Austin example. Neither contains an
+operator's registry or a published deployment digest.
 
-| Credential names | Purpose |
-| --- | --- |
-| `GOOGLE_MAPS_API_KEY`, `CESIUM_ION_TOKEN` | Browser map providers; intentionally browser-visible |
-| `GOOGLE_MAPS_SERVER_API_KEY` | Separate server-side Google Places/Street View key |
-| `OPENAI_API_KEY` | Voice and HUD summaries |
-| `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET` | Optional OpenSky OAuth; also change ConfigMap auth mode to `oauth` |
-| `OPENSKY_USERNAME`, `OPENSKY_PASSWORD` | Optional OpenSky basic auth; also change auth mode to `basic` |
-| `AISSTREAM_API_KEY` | Live vessels |
-| `FIRMS_MAP_KEY` | NASA FIRMS fires |
-| `TOMTOM_API_KEY` | Live traffic tiles |
-| `LL2_API_TOKEN`, `TFL_APP_KEY` | Optional provider allowances |
+The following creates an untracked Kustomize overlay using your selected namespace
+and verified image digests. JSON is valid YAML and is accepted by Kustomize.
 
-Use a **complete file containing every credential this workflow should retain**
-when updating an existing Secret. Server-side apply merges with fields owned by
-other managers, but omitting a key previously owned by this manager removes it.
-Do not use `--force-conflicts`; resolve ownership conflicts deliberately.
-This does not print Secret values or store them in a last-applied annotation:
+```python
+import json
+import os
+from pathlib import Path
+import re
 
-```bash
-set -euo pipefail
-# Set this to your existing credential file; do not put its contents in commands.
-SECRETS_ENV_FILE="/absolute/path/outside/checkout/provider-credentials.env"
-test -s "$SECRETS_ENV_FILE"
-kubectl --context aks-mira-caldova --namespace gods-eye-view \
-  create secret generic gods-eye-view-secrets \
-  --from-env-file="$SECRETS_ENV_FILE" --dry-run=client -o json |
-  python3 -c '
-import json, sys
-secret = json.load(sys.stdin)
-data = secret.get("data", {})
-allowed = set("""GOOGLE_MAPS_API_KEY CESIUM_ION_TOKEN GOOGLE_MAPS_SERVER_API_KEY
-OPENAI_API_KEY OPENSKY_CLIENT_ID OPENSKY_CLIENT_SECRET OPENSKY_USERNAME
-OPENSKY_PASSWORD AISSTREAM_API_KEY FIRMS_MAP_KEY TOMTOM_API_KEY LL2_API_TOKEN
-TFL_APP_KEY""".split())
-if not data or not set(data) <= allowed or not all(data.values()):
-    sys.exit("Refusing empty Secret, blank credentials, or non-credential settings.")
-json.dump(secret, sys.stdout)
-' |
-  kubectl --context aks-mira-caldova --namespace gods-eye-view \
-    apply --server-side --field-manager=gev-secret-env -f -
-```
-
-The intermediate Secret JSON travels only through the pipe. Do not enable shell
-tracing, pipe it to `tee`, request verbose HTTP logs, or run `kubectl get secret
--o yaml`. Kubernetes Secrets are not encrypted merely because their data is
-base64-encoded: use namespace-scoped RBAC and the cluster's encryption-at-rest
-controls. Pod environment access and exec permissions also grant access to keys.
-
-`GOOGLE_MAPS_API_KEY` and `CESIUM_ION_TOKEN` remain in the Secret at rest but are
-**necessarily exposed to the browser** through `/api/runtime-config.js`, a classic
-blocking script loaded before the application module. Restrict
-Google keys by API and the intended localhost HTTP referrer, and scope Cesium
-tokens to required public assets and allowed URLs. Prefer the separate
-server-side Google key with suitable API/IP restrictions. Only the allowlisted
-browser keys and `VITE_AIS_*` settings are returned; other credentials remain
-server-side.
-
-## 3. Configure and apply the digest-pinned workload
-
-The complete Kustomize directory also includes the regional source. Complete
-**Austin regional roads: build and initial import** below and record its image
-digest before this apply; replacing the app image alone leaves a deliberately
-unusable regional placeholder.
-
-Review `infra/aks/configmap.yaml` before applying. It sets `NODE_ENV=production`,
-`HOST=0.0.0.0`, `PORT=4173`, anonymous OpenSky access, the OpenAI model/context
-defaults from `.env.example`, same-origin `/api/ais-live`, and vessel/label caps.
-Google and OpenAI per-IP rate guards are explicitly enabled at 60 and 30
-requests/minute; TomTom's soft upstream-fetch ceiling is 6,000 per UTC day.
-These are **not billing caps**. Set provider-side quotas and usage limits too.
-Models and provider pricing may change independently of this deployment.
-
-Using `IMAGE_REF` from step 1, render and replace only this application's image:
-
-```bash
-set -euo pipefail
-[[ "${IMAGE_REF:-}" =~ ^acrmiracaldova\.azurecr\.io/gods-eye-view@sha256:[a-f0-9]{64}$ ]] || {
-  echo "Set IMAGE_REF to the verified ACR digest before applying." >&2
-  exit 1
+env = os.environ
+regional = env["USE_AUSTIN_EXAMPLE"]
+if regional not in ("true", "false"):
+    raise SystemExit("USE_AUSTIN_EXAMPLE must be true or false")
+directory = Path(env["AKS_OVERLAY_DIR"])
+if not directory.resolve().is_relative_to(Path(".azure").resolve()):
+    raise SystemExit("Keep local configuration beneath .azure/")
+namespace = env["NAMESPACE"]
+if len(namespace) > 63 or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", namespace):
+    raise SystemExit("Invalid Kubernetes namespace")
+images = []
+for name, variable in [
+    ("gods-eye-view", "APP_IMAGE_DIGEST"),
+] + ([("overpass-austin", "REGIONAL_IMAGE_DIGEST")] if regional == "true" else []):
+    digest = env[variable]
+    if not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
+        raise SystemExit(f"{variable} must be a verified digest")
+    images.append({"name": name, "newName": f"{env['ACR_LOGIN_SERVER']}/{name}", "digest": digest})
+base = Path("infra/aks/regional" if regional == "true" else "infra/aks")
+overlay = {
+    "apiVersion": "kustomize.config.k8s.io/v1beta1",
+    "kind": "Kustomization",
+    "namespace": namespace,
+    "resources": [os.path.relpath(base.resolve(), directory.resolve())],
+    "images": images,
 }
-kubectl --context aks-mira-caldova kustomize infra/aks |
-  sed -E "s|acrmiracaldova\\.azurecr\\.io/gods-eye-view[:@][^[:space:]]+|${IMAGE_REF}|g" |
-  kubectl --context aks-mira-caldova --namespace gods-eye-view apply -f -
-
-kubectl --context aks-mira-caldova --namespace gods-eye-view \
-  rollout status deployment/gods-eye-view --timeout=180s
-kubectl --context aks-mira-caldova --namespace gods-eye-view \
-  get deployment gods-eye-view \
-  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
-kubectl --context aks-mira-caldova --namespace gods-eye-view \
-  get pods,services,networkpolicies
+directory.mkdir(parents=True, exist_ok=True)
+(directory / "kustomization.yaml").write_text(json.dumps(overlay, indent=2) + "\n")
+print(f"Created {directory / 'kustomization.yaml'}")
 ```
 
-For an offline render only (no cluster access or deployment):
+Run that block with Python 3, or save it locally and execute it. It writes only
+deployment configuration, not credentials. Regenerating it replaces the overlay;
+preserve any custom patches you have added.
 
-```bash
-KUBECONFIG=/dev/null kubectl --context aks-mira-caldova kustomize infra/aks
+Review `infra/aks/base/configmap.yaml`. Put overrides in a ConfigMap patch in your
+local overlay, not in the shared base. For example, to select an operator-managed
+**full-planet** Overpass endpoint, add this Kustomize patch:
+
+```yaml
+patches:
+  - target:
+      kind: ConfigMap
+      name: gods-eye-view-config
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: gods-eye-view-config
+      data:
+        OVERPASS_UPSTREAMS_JSON: '["https://overpass.example.org/api/interpreter"]'
 ```
 
-Rendering checks Kustomize composition, **not full Kubernetes schema validity**.
-If `kubeconform` and a matching Kubernetes JSON-schema directory are already
-available, validate offline against the target cluster version without reading
-cluster credentials (set these two variables to your installed schema bundle):
+Replace the example URL with a real, authorized endpoint. Regional extracts must
+not be placed in the full-planet list.
+
+## Deploy the Application
+
+Do not apply the shared base directly: its image tags intentionally say
+`PLACEHOLDER`. Render and validate your overlay first.
 
 ```bash
-set -euo pipefail
-: "${KUBERNETES_VERSION:?Set the target Kubernetes version, for example 1.34.0}"
-: "${KUBERNETES_SCHEMA_LOCATION:?Set a local kubeconform schema-location template}"
-KUBECONFIG=/dev/null kubectl --context aks-mira-caldova kustomize infra/aks |
-  kubeconform -strict -summary \
-    -kubernetes-version "$KUBERNETES_VERSION" \
-    -schema-location "$KUBERNETES_SCHEMA_LOCATION"
+kubectl --context "$KUBE_CONTEXT" kustomize "$AKS_OVERLAY_DIR"
 ```
 
-Do not use server-side dry-run while cluster operations are blocked. Offline
-validation does not establish admission-policy compatibility, CNI enforcement,
-ACR pull permission, or successful scheduling.
-
-The pod runs as UID/GID 1000 with a read-only root filesystem, dropped
-capabilities, no privilege escalation, `RuntimeDefault` seccomp, and no mounted
-service-account token. `/app/.gev-cache` uses the `gods-eye-view-cache`
-managed-csi ReadWriteOnce PVC (8Gi request; Azure Standard SSD minimum billing
-tier is 32Gi). Writable `emptyDir` volumes are limited to
-`/app/.gev-logs` and `/tmp`. There is no writable key-setup UI
-or `.env` file; manage provider keys through the Secret, not the local
-development Provider Settings workflow.
-
-One replica requests 250m CPU / 512Mi memory and is limited to 2 CPU / 2Gi.
-Startup, readiness, and liveness probes use the named HTTP port. The Node
-process runs directly as PID 1 so it receives SIGTERM, with a 45-second
-termination grace period. `Recreate` avoids temporarily running two provider
-clients during updates; it deliberately introduces downtime. This is not an HA
-deployment.
-
-## 4. Access only from localhost
-
-Run in a dedicated terminal and keep it open:
+For a new namespace, create it before server-side validation of namespaced
+resources. This is a metadata-only operation and does not touch Secrets:
 
 ```bash
-kubectl --context aks-mira-caldova --namespace gods-eye-view \
+kubectl --context "$KUBE_CONTEXT" create namespace "$NAMESPACE" \
+  --dry-run=client -o yaml |
+  kubectl --context "$KUBE_CONTEXT" apply -f -
+kubectl --context "$KUBE_CONTEXT" apply --dry-run=server -k "$AKS_OVERLAY_DIR"
+kubectl --context "$KUBE_CONTEXT" apply -k "$AKS_OVERLAY_DIR"
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
+  rollout status deployment/gods-eye-view --timeout=300s
+```
+
+The app supports keyless startup. The manifests never create or replace an empty
+Secret over existing credentials. Single-replica `Recreate` updates introduce
+brief downtime and can disconnect an existing port-forward.
+
+If you selected the Austin example, wait separately for its initial import:
+
+```bash
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
+  logs deployment/overpass-austin -c import --follow
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
+  rollout status deployment/overpass-austin --timeout=7200s
+```
+
+## Add Provider API Keys
+
+| Secret key                   | Feature                                                             |
+| ---------------------------- | ------------------------------------------------------------------- |
+| `CESIUM_ION_TOKEN`           | Cesium terrain and imagery assets, including supported Bing assets. |
+| `GOOGLE_MAPS_API_KEY`        | Browser map and 3D tile features.                                   |
+| `GOOGLE_MAPS_SERVER_API_KEY` | Server-side Google Places and Street View.                          |
+| `OPENAI_API_KEY`             | Voice and HUD summaries.                                            |
+| `AISSTREAM_API_KEY`          | Live vessel feed.                                                   |
+| `FIRMS_MAP_KEY`              | NASA FIRMS fire observations.                                       |
+| `TOMTOM_API_KEY`             | Live traffic flow, separate from OSM road geometry.                 |
+
+See `.env.example` for additional provider credentials. Non-secret settings
+belong in `gods-eye-view-config`, not in the Secret.
+
+Create the Secret **only if it does not already exist**:
+
+```bash
+EXISTING_SECRET="$(
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
+    get secret gods-eye-view-secrets --ignore-not-found -o name
+)"
+if [ -z "$EXISTING_SECRET" ]; then
+  kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
+    create secret generic gods-eye-view-secrets
+fi
+```
+
+For example, set `PROVIDER_KEY=CESIUM_ION_TOKEN` and run the following in an
+interactive terminal. It prompts without echo, sends the value through stdin,
+and merges only that key, preserving the other credentials:
+
+```bash
+export PROVIDER_KEY="CESIUM_ION_TOKEN"
+python3 - <<'PY'
+import getpass, json, os, subprocess, warnings
+warnings.simplefilter("error", getpass.GetPassWarning)
+name = os.environ["PROVIDER_KEY"]
+allowed = {
+    "CESIUM_ION_TOKEN", "GOOGLE_MAPS_API_KEY", "GOOGLE_MAPS_SERVER_API_KEY",
+    "OPENAI_API_KEY", "AISSTREAM_API_KEY", "FIRMS_MAP_KEY", "TOMTOM_API_KEY",
+    "OPENSKY_CLIENT_ID", "OPENSKY_CLIENT_SECRET", "OPENSKY_USERNAME",
+    "OPENSKY_PASSWORD", "LL2_API_TOKEN", "TFL_APP_KEY",
+}
+if name not in allowed:
+    raise SystemExit("Choose a supported credential name")
+value = getpass.getpass(f"{name} (hidden): ").strip()
+if not value:
+    raise SystemExit("Empty value; nothing changed")
+result = subprocess.run([
+    "kubectl", "--context", os.environ["KUBE_CONTEXT"],
+    "-n", os.environ["NAMESPACE"], "patch", "secret", "gods-eye-view-secrets",
+    "--type=merge", "--patch-file=/dev/stdin",
+], input=json.dumps({"stringData": {name: value}}), text=True, capture_output=True)
+if result.returncode:
+    raise SystemExit("Secret update failed; credential-bearing output suppressed")
+print(f"Updated {name}; other credentials preserved")
+PY
+
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
+  rollout restart deployment/gods-eye-view
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
+  rollout status deployment/gods-eye-view --timeout=300s
+```
+
+Never put values in Git, command arguments, screenshots, or chat. Kubernetes
+Secret base64 encoding is not encryption; protect namespace RBAC and use your
+organization's encryption and secret-management controls.
+
+Cesium and the **browser** Google key necessarily reach the browser through
+`/api/runtime-config.js`. Restrict their scopes and allowed origins. Server-only
+keys, including AISStream, FIRMS, and TomTom, are not returned in that script.
+
+## Access and Verify the Deployment
+
+Keep this command running in a dedicated terminal:
+
+```bash
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" \
   port-forward --address 127.0.0.1 service/gods-eye-view 4173:80
 ```
 
-Then open <http://127.0.0.1:4173>. In another terminal:
+Open **http://127.0.0.1:4173**. In another terminal:
 
 ```bash
 curl --fail http://127.0.0.1:4173/healthz
 curl --fail http://127.0.0.1:4173/readyz
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get pods,pvc
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" get services,ingress
+kubectl --context "$KUBE_CONTEXT" -n "$NAMESPACE" top pods
 ```
 
-Do not bind port-forward to `0.0.0.0`, add an Ingress, use NodePort/LoadBalancer,
-or share the forwarding endpoint. Anyone who reaches the app can invoke its
-key-brokering APIs and spend provider quota; it is not a multi-user authenticated
-service.
+Expected results: ready pods, bound PVCs, `ClusterIP` services, and no application
+Ingress. The health endpoints verify the process, not every external provider.
+Restart the port-forward after pod replacements.
 
-The ingress-only NetworkPolicy has **no ingress rules** and denies ordinary
-inbound pod traffic when the cluster CNI enforces NetworkPolicy. Node/kubelet
-traffic (including probes and the normal Kubernetes port-forward path) is not
-blocked by this policy. Egress is intentionally unrestricted for DNS, HTTP(S),
-WebSockets, and external providers; existing cluster-wide policies or firewalls
-can still restrict it. Policies are additive: another policy selecting this pod
-could allow ingress. Verify enforcement with the cluster administrator rather
-than assuming that an accepted NetworkPolicy resource proves isolation.
+## Regional Roads and Traffic Coverage
 
-The target cluster reported `networkPolicy: none` on 2026-09-25. The included
-NetworkPolicy must therefore **not** be relied on for pod-level isolation; this
-deployment does not change the shared cluster's CNI configuration.
+Street Traffic combines **OSM road geometry** with optional **TomTom traffic
+flow**. A working TomTom key cannot replace missing OSM roads. TomTom supports
+Canada, including traffic data around Calgary, but road requests can still fail
+when public Overpass mirrors refuse or time out.
 
-Even without CNI policy enforcement, this configuration provisions **no public
-Service or ingress**. However, ClusterIP alone does not prevent other workloads
-or private-network clients with cluster routing from reaching the API. An
-administrator with exec/port-forward permissions also bypasses this isolation.
+The optional Austin example covers latitude **29.9–30.7** and longitude
+**-98.2–-97.2**. It downloads a public Geofabrik Texas extract, crops complete
+ways, imports highway ways and their referenced nodes, and verifies downtown
+roads before activating an immutable snapshot. It does **not** cover Calgary.
+For another region, use an appropriate road source; changing only the
+ConfigMap bounds does not expand the database. The current example's importer
+and startup checks are Austin-specific and must be adapted together.
 
-## Updates, verification, and operations
+Only fully contained, supported highway-bbox queries use the regional service.
+Outside, boundary, admin, and unfamiliar queries stay on global sources.
+Regional failures fall back to global mirrors; no regional empty response is
+presented as authoritative data for another city.
 
-- **Secret or ConfigMap change:** repeat the appropriate apply above, then
-  restart; environment variables are read when the pod starts, not hot-reloaded.
-  Reapplying the ConfigMap alone does not trigger a rollout.
+The database PVC is 64Gi; the application cache PVC is 8Gi (Azure may bill a
+larger minimum disk tier). The regional init and server each request 1 CPU /
+2Gi and limit 2 CPU / 6Gi; they run sequentially. Import duration depends on
+download speed and disk performance. `/healthz` on the regional service reports
+the source OSM timestamp and snapshot metadata, not a claim of real-time updates.
 
-  ```bash
-  kubectl --context aks-mira-caldova --namespace gods-eye-view \
-    rollout restart deployment/gods-eye-view
-  kubectl --context aks-mira-caldova --namespace gods-eye-view \
-    rollout status deployment/gods-eye-view --timeout=180s
-  ```
+Refresh is a **manual snapshot import**, not planet replication. Keep old snapshots
+for rollback. Review `infra/aks/overpass-refresh.yaml`, substitute your verified
+regional image digest, and create a refresh Job only after scaling the regional
+Deployment to zero and waiting for its pod to terminate. Restore one replica
+afterward, even if the refresh fails. Never remove the PVC or current snapshot
+as a troubleshooting shortcut.
 
-- **Image update/rollback:** build and record a new digest, or set `IMAGE_REF` to
-  a previously recorded digest, then repeat step 3. Never reapply the placeholder
-  or use a mutable `latest` tag. Reconnect port-forward after a pod replacement.
-- **Optional keys:** absent map keys fall back to keyless basemaps; OpenSky
-  remains anonymous/rate-limited; missing OpenAI, FIRMS, or AIS keys disable or
-  degrade those features; missing TomTom uses simulated traffic. Unconfigured
-  provider failures do not mean the process health checks should fail.
-- **Persistent cache:** `.gev-cache/overpass` and the on-disk TomTom budget now
-  survive pod replacement on the cache PVC. Do not delete/recreate the PVC or
-  wipe its contents during updates. Before the first migration from `emptyDir`,
-  preserve any valuable existing cache separately; an old pod's `emptyDir`
-  cannot be recovered after replacement. The observed Overpass cache was empty.
-  File logs remain ephemeral and process-local rate limits still reset on
-  process restart. Provider-side quotas remain essential.
-- **Troubleshooting:** inspect status/events for image-pull, admission,
-  scheduling, or probe failures. Check the existing node identity's ACR pull
-  permission with an administrator; do not enable admin registry credentials as
-  a shortcut.
+## Troubleshooting
 
-  ```bash
-  kubectl --context aks-mira-caldova --namespace gods-eye-view \
-    describe deployment gods-eye-view
-  kubectl --context aks-mira-caldova --namespace gods-eye-view \
-    get events --sort-by=.lastTimestamp
-  ```
+| Symptom                    | Check                                                                                                                                                                                                                                  |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ImagePullBackOff`         | Digest exists, registry is reachable, and kubelet has the correct pull role. Allow RBAC propagation; do not enable registry passwords as a shortcut.                                                                                   |
+| `Pending` PVC              | `managed-csi`, node capacity, disk quota, and attachment events. `WaitForFirstConsumer` is normal until a pod is scheduled.                                                                                                            |
+| Street Traffic unavailable | Inspect the road source separately from TomTom. Three attempts are allowed per destination; failures stay visible during retry. A request/body deadline is 95 seconds. Move to a new area or toggle the layer after fixing the source. |
+| Regional init failed       | Inspect import logs and the named staging directory. An unfinished-import marker prevents repeated downloads from filling the disk. Diagnose before removing only that marker.                                                         |
+| Data disappears on restart | Check the app cache PVC mount. A repeated road query on a replacement pod should report `x-overpass-cache: DISK`, not depend on its old memory cache.                                                                                  |
+| No network isolation       | Check the existing cluster's policy engine. A NetworkPolicy object alone does not mean it is enforced. Do not modify a shared cluster's CNI without a separate plan.                                                                   |
 
-  If reviewing application logs, treat them as private operational data and
-  redact any provider URLs or identifiers before sharing. Do not dump pod
-  environments or Secret contents for troubleshooting.
+## Security and Production Considerations
 
-### Traffic unavailable versus loading
+| Area               | Recommendation                                                                                                                                           |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Access             | Keep the service private and port-forward bound to loopback. Restrict AKS API access and use appropriate Entra/RBAC controls.                            |
+| Credentials        | Keep provider keys in Secrets and CI identity IDs in Actions variables. No provider keys belong in image builds.                                         |
+| Containers         | Non-root UID/GID 1000, read-only root, dropped capabilities, restricted pod security, no service-account token.                                          |
+| Network policy     | The app denies ordinary incoming pod traffic. Cilium enforces it on the new-cluster path; existing clusters must be checked.                             |
+| Availability       | One app replica with `Recreate` is not HA. Back up persistent data and plan downtime for updates.                                                        |
+| Resources          | App requests 250m CPU / 512Mi, limits 2 CPU / 2Gi. Adjust from measurements, not browser rendering load.                                                 |
+| Freshness and cost | Cached responses can be stale. Check source timestamps, refresh regional snapshots, set provider-side quotas, and monitor storage/image retention costs. |
 
-The traffic client permits **three total attempts per viewport**, not unlimited
-automatic retries. Its failure indication remains visible throughout retry
-backoff; each attempt has a **95-second request-plus-response-body deadline**.
-When no roads are rendered, failure is explicitly **unavailable**, not a
-successful empty road layer. After the budget is exhausted, manually toggle
-the layer or move to a new viewport to reset it. This does not reset an
-upstream provider's quota or restore its service.
+## Cleanup
 
-First inspect whether the viewport's entire queried bbox lies inside Austin
-coverage: latitude **29.9–30.7**, longitude **−98.2–−97.2**. Crossing an edge,
-being partially inside, or being outside keeps that request on the global
-sources. Only the supported highway-bbox grammar can use the regional source;
-admin, boundary, `around`, and `is_in` queries stay global even near Austin.
-The known public-mirror 406 responses and timeouts therefore remain a real
-limitation outside regional road coverage. Repeated toggling cannot repair
-them. Inside coverage, check the regional import logs, readiness, snapshot
-timestamp and `x-overpass-upstream`; cached responses may predate a refresh.
-
-## Austin regional roads: build and initial import
-
-The private source is deliberately **not a full-planet Overpass service**.
-Coverage is latitude **29.9–30.7**, longitude **−98.2–−97.2**, chosen as a
-conservative Austin-area operational default. Only highway ways and their
-referenced nodes are imported. No admin relations, area generation, attic,
-planet cloning or planet replication runs.
-
-`OVERPASS_REGIONAL_URL` and `OVERPASS_REGIONAL_BOUNDS` in the app ConfigMap are
-server-only, read once at startup, and must be supplied together. Bounds are
-`south,west,north,east`. The provider fully matches a small grammar (the app's
-`(way["highway"~"..."](s,w,n,e););out geom qt;` queries), requires **every** bbox
-to be inside coverage, and tries the private source first only in that case.
-Crossing, overlapping, outside, around, boundary, admin, `is_in`, recursion,
-non-road, and unfamiliar queries keep the full-planet path. Regional failures
-fall through to those mirrors; HTTP-200 errors are not authoritative empties.
-This does not make the currently failing global mirrors reliable outside Austin.
-The regional HTTP adapter independently enforces the same road/coverage rules.
-
-Unset both variables to disable regional routing. `OVERPASS_UPSTREAMS_JSON`
-optionally replaces the ordered **full-planet** list with operator-controlled
-http(s) interpreter URLs; no credentials, query strings, fragments or whitespace
-are accepted. Private `.svc` hosts are intentionally allowed. Never put a
-regional extract in that full-planet list. Invalid config fails server startup.
-There is no request-level endpoint override or User-Agent evasion.
-
-Build from the small, credential-free `infra/overpass` context:
-
-The image reuses already-compiled, digest-pinned upstream binaries; this is a
-small wrapper build, **not a fresh C++ compile or Texas import**. Allow roughly
-**2–10 minutes plus ACR queue time and image-layer transfer** as a planning
-allowance; the first successful build/push took 43 seconds, and the final
-self-tested build took 35 seconds on 2026-09-25. The separate first import runs on AKS after
-image publication and is estimated below. Either an authorized ACR remote
-build or a CI Docker build/push can publish it; both must use this same context
-and record the resulting digest. The GitHub OIDC identity template is
-`infra/ci/identity.bicep` (ARM validation passed during preparation). Identity
-template validation is not proof that federation, AcrPush or an image build
-has actually completed.
+Delete the namespace **only if it is dedicated to this deployment**. This removes
+Secrets, workloads, and PVCs; backing disks may be deleted by the reclaim policy.
 
 ```bash
-REGIONAL_TAG="austin-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
-az acr build --registry acrmiracaldova --platform linux/amd64 \
-  --file infra/overpass/Dockerfile --image "overpass-austin:${REGIONAL_TAG}" infra/overpass
-REGIONAL_DIGEST="$(az acr repository show --name acrmiracaldova \
-  --image "overpass-austin:${REGIONAL_TAG}" --query digest --output tsv)"
-[[ "$REGIONAL_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || exit 1
-REGIONAL_REF="acrmiracaldova.azurecr.io/overpass-austin@${REGIONAL_DIGEST}"
+kubectl --context "$KUBE_CONTEXT" delete namespace "$NAMESPACE"
 ```
 
-Record this digest in `infra/aks/kustomization.yaml` as another `images` entry
-named `acrmiracaldova.azurecr.io/overpass-austin` **before applying step 3**.
-Both the init container and server must resolve to that digest; never deploy
-the placeholder. The manual refresh Job below is intentionally not included in
-Kustomize and takes the same image explicitly.
-
-The derived Dockerfile pins upstream `wiktorn/overpass-api` **v0.7.62.11** at
-`sha256:5f643f2aa500333f19458fe8be14457215d6e0b9f891ca5c5ed452b1f8882c47`
-(registry index and linux/amd64 manifest verified 2026-09-25). Its root-oriented
-entrypoint, nginx, supervisor, eval-based preprocessing, updater, and dispatcher
-are **not run**. UID/GID 1000 runs `bootstrap.py`, then `server.py`. The latter
-invokes `/app/bin/osm3s_query --db-dir=...`, the upstream-supported direct,
-read-only database mode. No executable commands come from configuration.
-Upstream references: [container scripts](https://github.com/wiktorn/Overpass-API),
-[direct query CLI](https://github.com/drolbr/Overpass-API/blob/master/src/overpass_api/dispatch/osm3s_query.cc),
-[import CLI](https://github.com/drolbr/Overpass-API/blob/master/src/overpass_api/osm-backend/update_database.cc).
-
-First startup uses an init container to download the **public**, no-auth
-[Texas PBF](https://download.geofabrik.de/north-america/us/texas-latest.osm.pbf),
-crop with `osmium extract --strategy=complete_ways`, retain `w/highway` and
-referenced nodes via `osmium tags-filter`, then stream XML into
-`update_database --flush-size=16 --compression-method=gz
---map-compression-method=gz --version=<source timestamp>`. Complete ways retain
-their outside-bbox nodes so road geometries at the crop edge are not truncated.
-A nonempty downtown Austin road count must pass before activation.
-
-The 64Gi managed-csi RWO disk allows source/download staging, import scratch,
-and retained snapshots. Init and server each request **1 CPU / 2Gi**, limit
-**2 CPU / 6Gi**; they run sequentially, not concurrently. The server permits
-two concurrent queries with 256MiB QL budgets and an 18-second hard subprocess
-deadline. Allow **roughly 15–90 minutes for first download/import** at these
-limits (estimate, not measured on this cluster; slow disk/network may take
-longer). Observe init logs instead of assuming the app's 180-second rollout
-timeout covers it. An OOM/failure never activates a partial DB.
-An interrupted first import leaves `/db/bootstrap-in-progress`; subsequent
-init retries fail loudly instead of redownloading Texas until the disk fills.
-Inspect the named staging directory and diagnose the failure, then remove only
-that marker to authorize a fresh import (retain failed staging until reviewed).
+Delete the cluster or registry only if you created them exclusively for this
+exercise and have reviewed the impact:
 
 ```bash
-kubectl --context aks-mira-caldova -n gods-eye-view logs \
-  deployment/overpass-austin -c import -f
-kubectl --context aks-mira-caldova -n gods-eye-view rollout status \
-  deployment/overpass-austin --timeout=7200s
+az aks delete --resource-group "$RESOURCE_GROUP" --name "$CLUSTER_NAME"
+az acr delete --resource-group "$RESOURCE_GROUP" --name "$ACR_NAME"
 ```
 
-Data lives in `/db/snapshots/<UTC-id>/database`; `snapshot.json` records source
-URL, resolved dated URL, SHA-256, Last-Modified, OSM timestamp, coverage,
-import time and version. `/db/current` switches atomically only after a
-successful import/check. The server mounts the disk **read-only**, resolves the
-snapshot once and checks real downtown roads before binding port 8080.
-`GET /healthz` returns this snapshot metadata; it does **not** claim current
-planet freshness. Query JSON retains `osm3s.timestamp_osm_base` from that source.
-`cachedAt` means cache fetch time, **not OSM data age**. Existing 24h memory /
-7-day disk / stale-outage semantics are unchanged; refresh does not wipe cache.
+## References
 
-All pods satisfy restricted PSS (nonroot, no privilege escalation, all caps
-dropped, RuntimeDefault seccomp). Service `overpass-austin` is ClusterIP only.
-Its NetworkPolicy allows app pods in the same namespace; the existing app
-ingress-deny policy does not prevent outbound regional requests. The cluster's
-`networkPolicy: none` remains unchanged, so do not claim enforced isolation.
-
-Validate from the app pod (no provider keys needed), and verify a **nonempty**
-`elements` array and `x-overpass-upstream` identifying the private service for:
-
-```text
-[out:json][timeout:15];(way["highway"~"primary|secondary|residential"](30.26,-97.75,30.28,-97.73););out geom qt;
-```
-
-Also test a bbox outside Austin and an admin query: neither may be sent to this
-regional source. Repeat a successful request across an **app** rollout and
-verify `x-overpass-cache: DISK` (or HIT after warming). Check `/healthz` snapshot
-date separately; a successful cached response is not proof of current OSM data.
-
-## Non-destructive regional refresh
-
-Refresh is **manual**, not minute replication; check snapshot age operationally
-and refresh weekly or when source changes matter. Full-planet diffs would break
-the roads-only extract contract. Keep old snapshots for rollback.
-
-1. Confirm disk free space for another Texas source + import + retained DB.
-   Scale only `deployment/overpass-austin` to zero and wait for termination
-   (RWO disk detach); app can serve durable stale cache or global fallback.
-2. Create the manual Job with the verified regional image. Do not use `apply`
-   against a Job generated for an earlier refresh:
-
-   ```bash
-   [[ "${REGIONAL_REF:-}" =~ ^acrmiracaldova\.azurecr\.io/overpass-austin@sha256:[a-f0-9]{64}$ ]] || exit 1
-   kubectl --context aks-mira-caldova -n gods-eye-view scale \
-     deployment/overpass-austin --replicas=0
-   kubectl --context aks-mira-caldova -n gods-eye-view wait \
-     --for=delete pod -l app.kubernetes.io/name=overpass-austin --timeout=180s
-   sed "s|acrmiracaldova.azurecr.io/overpass-austin:PLACEHOLDER|${REGIONAL_REF}|" \
-     infra/aks/overpass-refresh.yaml |
-     kubectl --context aks-mira-caldova -n gods-eye-view create -f -
-   ```
-
-3. Watch that Job's logs and completion (four-hour Job deadline). Failure leaves
-   `/db/current` and all previous snapshots intact; inspect failed staging
-   before explicitly removing only unwanted staging directories. Never wipe
-   the PVC, `.gev-cache`, or current/retained snapshots as a recovery shortcut.
-4. Scale `deployment/overpass-austin` back to one whether refresh succeeded or
-   failed; its init reuses current, and server startup verifies real data.
-   Check `/healthz` for expected `id` and `osm_timestamp`.
-   Rollback uses the same stopped-writer procedure and an atomic symlink switch
-   to a verified retained snapshot, never database-file replacement in place.
-
-Validation status: offline Node/provider tests, Python grammar checks and
-Kustomize rendering are covered. ACR remote build **dtt** succeeded on
-2026-09-25 in **35 seconds**, publishing
-`acrmiracaldova.azurecr.io/overpass-austin:regional-20260925-1628` at
-`sha256:8e3107dfc0ba9a62f793833f6873a753ff512edc019f843e89c2a97c03ec64ee`
-(recorded in Kustomize). Its mandatory build-time smoke test imported synthetic
-OSM data **as UID 1000**, queried a real way plus two geometry points through
-`osm3s_query`, and verified preservation of the OSM source timestamp. No Texas
-download was included in the image. The first ACR attempt used a caller-relative
-`--file Dockerfile` and selected the app Dockerfile; the corrected command above
-uses the explicit `infra/overpass/Dockerfile` path with the small regional context.
-**Full Texas crop/import on AKS, admission, actual resource use and live
-data/cache-rollout checks remain required before declaring deployment ready**.
+- [Azure CNI powered by Cilium](https://learn.microsoft.com/azure/aks/azure-cni-powered-by-cilium)
+- [Integrate AKS with ACR](https://learn.microsoft.com/azure/aks/cluster-container-registry-integration)
+- [AKS API server authorized IP ranges](https://learn.microsoft.com/azure/aks/api-server-authorized-ip-ranges)
+- [TomTom traffic market coverage](https://docs.tomtom.com/traffic-api/documentation/tomtom-maps/v1/product-information/market-coverage)
+- [Publishing images with GitHub Actions](ACR-CI.md)

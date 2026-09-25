@@ -4,7 +4,6 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   generateName: overpass-austin-refresh-
-  namespace: gods-eye-view
 spec:
   backoffLimit: 0
   activeDeadlineSeconds: 14400
@@ -28,7 +27,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: import
-          image: acrmiracaldova.azurecr.io/overpass-austin:PLACEHOLDER
+          image: overpass-austin:PLACEHOLDER
           args: ['/opt/regional/bootstrap.py', '--refresh']
           resources:
             requests:

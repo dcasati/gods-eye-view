@@ -116,7 +116,8 @@ test('publisher accepts only expected main identity, target, and unique run tag'
   const uuid = '00000000-0000-0000-0000-000000000001';
   const env = {
     ...process.env,
-    GITHUB_REPOSITORY: 'dcasati/gods-eye-view',
+    GITHUB_REPOSITORY: 'example-owner/gods-eye-view',
+    PUBLISH_REPOSITORY: 'example-owner/gods-eye-view',
     GITHUB_REF: 'refs/heads/main',
     GITHUB_EVENT_NAME: 'workflow_dispatch',
     GITHUB_SHA: sha,
@@ -125,8 +126,8 @@ test('publisher accepts only expected main identity, target, and unique run tag'
     GITHUB_RUN_ID: '123',
     GITHUB_RUN_ATTEMPT: '2',
     IMAGE_TAG: `run-123-2-${sha.slice(0, 12)}-${sha.slice(0, 12)}`,
-    ACR_NAME: 'acrmiracaldova',
-    ACR_LOGIN_SERVER: 'acrmiracaldova.azurecr.io',
+    ACR_NAME: 'exampleacr',
+    ACR_LOGIN_SERVER: 'exampleacr.azurecr.io',
     IMAGE_NAME: 'gods-eye-view',
     AZURE_CLIENT_ID: uuid,
     AZURE_TENANT_ID: uuid,
@@ -139,7 +140,17 @@ test('publisher accepts only expected main identity, target, and unique run tag'
       env: { ...env, ...overrides },
     });
   assert.equal(run().status, 0);
+  assert.equal(
+    run({
+      GITHUB_REPOSITORY: 'another-owner/another-fork',
+      PUBLISH_REPOSITORY: 'another-owner/another-fork',
+      ACR_NAME: 'anotheracr',
+      ACR_LOGIN_SERVER: 'anotheracr-abc123.azurecr.io',
+    }).status,
+    0,
+  );
   for (const overrides of [
+    { PUBLISH_REPOSITORY: '' },
     { GITHUB_REPOSITORY: 'attacker/fork' },
     { GITHUB_REF: 'refs/heads/feature' },
     { GITHUB_EVENT_NAME: 'pull_request_target' },
@@ -177,9 +188,9 @@ test('publication streams credentials privately, locks the version tag, and reco
 set -euo pipefail
 printf 'az %s\\n' "$*" >> "$COMMAND_LOG"
 case "$*" in
-  'acr login --name acrmiracaldova --expose-token --query accessToken --output tsv') printf 'secret-fixture-token\\n' ;;
-  'acr repository show --name acrmiracaldova --image gods-eye-view:'*' --query digest --output tsv'|'acr repository show --name acrmiracaldova --image overpass-austin:'*' --query digest --output tsv') printf '%s\\n' "$TEST_DIGEST" ;;
-  'acr repository update --name acrmiracaldova --image gods-eye-view:'*' --write-enabled false --delete-enabled false --output none'|'acr repository update --name acrmiracaldova --image overpass-austin:'*' --write-enabled false --delete-enabled false --output none') ;;
+  'acr login --name exampleacr --expose-token --query accessToken --output tsv') printf 'secret-fixture-token\\n' ;;
+  'acr repository show --name exampleacr --image gods-eye-view:'*' --query digest --output tsv'|'acr repository show --name exampleacr --image overpass-austin:'*' --query digest --output tsv') printf '%s\\n' "$TEST_DIGEST" ;;
+  'acr repository update --name exampleacr --image gods-eye-view:'*' --write-enabled false --delete-enabled false --output none'|'acr repository update --name exampleacr --image overpass-austin:'*' --write-enabled false --delete-enabled false --output none') ;;
   *) exit 99 ;;
 esac
 `,
@@ -208,7 +219,8 @@ esac
       env: {
         ...process.env,
         PATH: `${path.join(directory, 'bin')}${path.delimiter}${process.env.PATH}`,
-        GITHUB_REPOSITORY: 'dcasati/gods-eye-view',
+        GITHUB_REPOSITORY: 'example-owner/gods-eye-view',
+        PUBLISH_REPOSITORY: 'example-owner/gods-eye-view',
         GITHUB_REF: 'refs/heads/main',
         GITHUB_EVENT_NAME: 'push',
         GITHUB_SHA: sha,
@@ -217,8 +229,8 @@ esac
         GITHUB_RUN_ID: '123',
         GITHUB_RUN_ATTEMPT: '2',
         IMAGE_TAG: tag,
-        ACR_NAME: 'acrmiracaldova',
-        ACR_LOGIN_SERVER: 'acrmiracaldova.azurecr.io',
+        ACR_NAME: 'exampleacr',
+        ACR_LOGIN_SERVER: 'exampleacr.azurecr.io',
         IMAGE_NAME: 'gods-eye-view',
         AZURE_CLIENT_ID: uuid,
         AZURE_TENANT_ID: uuid,
@@ -237,14 +249,14 @@ esac
   const commands = readFileSync(log, 'utf8');
   assert.match(
     commands,
-    /docker login acrmiracaldova.azurecr.io --username 00000000-0000-0000-0000-000000000000 --password-stdin/,
+    /docker login exampleacr.azurecr.io --username 00000000-0000-0000-0000-000000000000 --password-stdin/,
   );
   assert.match(commands, /--write-enabled false --delete-enabled false/);
   assert.equal(commands.includes('secret-fixture-token'), false);
   const receipt = JSON.parse(
     readFileSync(path.join(directory, '.ci-output/publication.json'), 'utf8'),
   );
-  assert.equal(receipt.image, `acrmiracaldova.azurecr.io/gods-eye-view:${tag}`);
+  assert.equal(receipt.image, `exampleacr.azurecr.io/gods-eye-view:${tag}`);
   assert.equal(receipt.digest, digest);
   assert.equal(receipt.downstream, sha);
   assert.equal(receipt.upstream, sha);
@@ -256,11 +268,11 @@ esac
   );
   assert.equal(
     regionalReceipt.image,
-    `acrmiracaldova.azurecr.io/overpass-austin:${tag}`,
+    `exampleacr.azurecr.io/overpass-austin:${tag}`,
   );
   assert.equal(
     regionalReceipt.pullReference,
-    `acrmiracaldova.azurecr.io/overpass-austin@${digest}`,
+    `exampleacr.azurecr.io/overpass-austin@${digest}`,
   );
   assert.equal(regionalReceipt.downstream, sha);
   assert.equal(regionalReceipt.upstream, sha);
@@ -276,15 +288,13 @@ esac
   );
 });
 
-test('Azure federation matches the fork immutable OIDC subject and only main', () => {
+test('Azure federation requires an operator-provided registry and exact subject', () => {
   const template = readFileSync(
     new URL('../../infra/ci/identity.bicep', import.meta.url),
     'utf8',
   );
-  assert.match(
-    template,
-    /param githubOidcSubject string = 'repo:dcasati@3240777\/gods-eye-view@1387844308:ref:refs\/heads\/main'/,
-  );
+  assert.match(template, /^param githubOidcSubject string$/m);
+  assert.match(template, /^param registryName string$/m);
   assert.match(template, /subject: githubOidcSubject/);
   assert.match(template, /scope: registry/);
 });
