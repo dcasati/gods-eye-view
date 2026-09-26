@@ -497,6 +497,22 @@ Never run the default Austin refresh Job against the Calgary PVC.
 | Resources          | App requests 250m CPU / 512Mi, limits 2 CPU / 2Gi. Adjust from measurements, not browser rendering load.                                                 |
 | Freshness and cost | Cached responses can be stale. Check source timestamps, refresh regional snapshots, set provider-side quotas, and monitor storage/image retention costs. |
 
+### AIS feed resource usage
+
+With an AISStream key configured, the server maintains the worldwide vessel
+subscription even when no browser is open. This consumes CPU and memory
+independently of globe rendering. Compare pod usage against both requests and
+limits before increasing resources.
+
+Vessel positions and static metadata are each capped at 50,000 entries.
+Overflow evicts the least recently ingested entry without sorting the cache.
+Expiry cleanup runs on feed or API activity at most once every 15 seconds,
+rather than scanning all vessels for every incoming position. Inactive entries
+expire after 30 minutes; active position updates retain their static metadata.
+Expired positions and tracks are hidden immediately on reads, including between
+cleanup passes. Track thinning and the 64-sample per-vessel history are unchanged.
+This cache is process-local, so a restart still clears vessel history.
+
 ## Cleanup
 
 Delete the namespace **only if it is dedicated to this deployment**. This removes
