@@ -410,8 +410,10 @@ Restart the port-forward after pod replacements.
 
 Street Traffic combines **OSM road geometry** with optional **TomTom traffic
 flow**. A working TomTom key cannot replace missing OSM roads. TomTom supports
-Canada, including traffic data around Calgary, but road requests can still fail
-when public Overpass mirrors refuse or time out.
+Canada, including traffic data around Calgary. Upstream now uses tile-backed OSM
+data for normal map layers instead of public Overpass mirrors. The optional
+regional services below remain available for explicitly requested detailed road
+queries; they do not replace or expand the tile source.
 
 | Profile | Latitude | Longitude | Public source | Snapshot PVC |
 | ------- | -------- | --------- | ------------- | ------------ |
@@ -420,7 +422,8 @@ when public Overpass mirrors refuse or time out.
 
 Calgary coverage includes the city and nearby Airdrie, Cochrane, Chestermere,
 and Okotoks inside that rectangle. It is **not all Alberta**; Edmonton, Banff,
-and queries crossing the rectangle remain on global sources. Import downloads
+and queries crossing the rectangle require an explicitly configured full-planet
+source for detailed Overpass queries. Import downloads
 the Alberta extract, then crops complete ways and retains only highway ways and
 referenced nodes. Download/crop intermediates are removed after validation.
 
@@ -433,8 +436,11 @@ compatible. Changing application bounds alone cannot expand a database.
 The Calgary overlay replaces the legacy single-region settings with
 `OVERPASS_REGIONS_JSON`, a nonempty array of `{"url": "...", "bounds": [south,
 west, north, east]}`. Do not combine it with `OVERPASS_REGIONAL_URL` /
-`OVERPASS_REGIONAL_BOUNDS`. Endpoints are private service URLs; global sources
-remain in `OVERPASS_UPSTREAMS_JSON`. Bad configuration fails startup.
+`OVERPASS_REGIONAL_BOUNDS`. Endpoints are private service URLs. Optional
+full-planet sources use `OVERPASS_UPSTREAMS` (comma-separated URLs) or the legacy
+`OVERPASS_UPSTREAMS_JSON` array, never both. Use only instances you operate or
+pay for. No public Overpass mirror is contacted by default. Invalid regional or
+legacy JSON configuration fails startup.
 
 After selecting the Calgary overlay, verify its separate import and rollout:
 
@@ -448,15 +454,19 @@ curl --fail --data-urlencode \
   http://127.0.0.1:4173/api/overpass
 ```
 
-The response should contain nonempty road ways with geometry. In the browser,
-navigate to downtown Calgary and enable Street Traffic; confirm roads finish
-loading and the traffic status reports dots and TomTom coverage. This animation
-combines road geometry with traffic-flow estimates, not individually tracked cars.
+The response should contain nonempty road ways with geometry. This verifies the
+optional regional API, not Street Traffic's current tile-backed source. In the
+browser, Street Traffic's OSM mode uses OpenFreeMap tiles, TomTom mode uses flow
+tile geometry, and Hybrid adds OpenFreeMap coverage. Missing TomTom credentials
+fall back to OpenFreeMap, not regional Overpass. The animation combines road
+geometry with traffic-flow estimates, not individually tracked cars.
 
 Only fully contained, supported highway-bbox queries use the regional service.
-Outside, boundary, admin, and unfamiliar queries stay on global sources.
-Regional failures fall back to global mirrors; no regional empty response is
-presented as authoritative data for another city.
+Outside, boundary, admin, and unfamiliar queries use only configured full-planet
+sources. Regional failures fall back only to those configured sources. Without a
+matching source, detailed queries return `OVERPASS_NOT_CONFIGURED` or retained
+last-good cached data. No regional empty response is presented as authoritative
+data for another city. Upstream URLs are no longer exposed in response headers.
 
 Snapshot PVC sizes are listed above; the application cache PVC is 8Gi (Azure may
 bill a larger minimum disk tier). Each regional init and server requests 1 CPU /

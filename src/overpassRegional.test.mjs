@@ -10,6 +10,7 @@ import { fetchOverpassPayload } from '../server/providers/overpass/transport.js'
 
 const bounds = [29.9, -98.2, 30.7, -97.2];
 const globals = ['https://global.example/api/interpreter'];
+let transportNow = Date.now();
 const config = loadOverpassSourceConfig(
   {
     OVERPASS_REGIONAL_URL:
@@ -183,6 +184,7 @@ test('regional failures, runtime errors and invalid 200s fall through to full-pl
     const tried = [];
     const result = await fetchOverpassPayload(form(road()), 1e6, {
       sourceConfig: config,
+      now: () => transportNow,
       fetchImpl: async (url) => {
         tried.push(url);
         if (url === config.regions[0].url && failure instanceof Error)
@@ -197,27 +199,28 @@ test('regional failures, runtime errors and invalid 200s fall through to full-pl
       simplify: (body) => body,
     });
 
-    test('regional success stops fan-out while outside roads never contact regional', async () => {
-      for (const bbox of ['30.26,-97.75,30.28,-97.73', '40,-74,40.1,-73.9']) {
-        const tried = [];
-        const result = await fetchOverpassPayload(form(road(bbox)), 1e6, {
-          sourceConfig: config,
-          fetchImpl: async (url) => {
-            tried.push(url);
-            return { status: 200, headers: { get: () => 'application/json' } };
-          },
-          readBody: async () => '{"elements":[{"type":"way","id":123}]}',
-          simplify: (body) => body,
-        });
-        const expected = bbox.startsWith('40')
-          ? globals[0]
-          : config.regions[0].url;
-        assert.equal(result.endpoint, expected);
-        assert.deepEqual(tried, [expected]);
-      }
-    });
     assert.deepEqual(tried, [config.regions[0].url, ...globals]);
-    assert.equal(result.endpoint, globals[0]);
+    assert.equal(result.endpoint, 'configured');
+    transportNow += 600_000;
+  }
+});
+
+test('regional success stops fan-out while outside roads never contact regional', async () => {
+  for (const bbox of ['30.26,-97.75,30.28,-97.73', '40,-74,40.1,-73.9']) {
+    const tried = [];
+    const result = await fetchOverpassPayload(form(road(bbox)), 1e6, {
+      sourceConfig: config,
+      now: () => transportNow,
+      fetchImpl: async (url) => {
+        tried.push(url);
+        return { status: 200, headers: { get: () => 'application/json' } };
+      },
+      readBody: async () => '{"elements":[{"type":"way","id":123}]}',
+      simplify: (body) => body,
+    });
+    const expected = bbox.startsWith('40') ? globals[0] : config.regions[0].url;
+    assert.equal(result.endpoint, 'configured');
+    assert.deepEqual(tried, [expected]);
   }
 });
 
@@ -335,6 +338,7 @@ test('Calgary failures fall back globally, never to the Austin-only database', a
       1e6,
       {
         sourceConfig: multi,
+        now: () => transportNow,
         fetchImpl: async (url) => {
           tried.push(url);
           return {
@@ -352,7 +356,8 @@ test('Calgary failures fall back globally, never to the Austin-only database', a
     );
 
     assert.deepEqual(tried, failed ? [calgary.url, ...globals] : [calgary.url]);
-    assert.equal(result.endpoint, failed ? globals[0] : calgary.url);
+    assert.equal(result.endpoint, 'configured');
+    transportNow += 600_000;
   }
 });
 

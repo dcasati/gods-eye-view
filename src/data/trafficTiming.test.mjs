@@ -126,7 +126,6 @@ test('traffic timing pairs real ordering to the scheduling change and guards re-
   const { createServer } = await import('vite');
   const originalWindow = globalThis.window;
   const originalDocument = globalThis.document;
-  const originalFetch = globalThis.fetch;
   const originalSetTimeout = globalThis.setTimeout;
   const originalClearTimeout = globalThis.clearTimeout;
   const originalSetInterval = globalThis.setInterval;
@@ -173,16 +172,22 @@ test('traffic timing pairs real ordering to the scheduling change and guards re-
     });
     const traffic = await server.ssrLoadModule('/src/data/traffic.js');
     trafficLayer = traffic.default;
+    const roadRequests = [];
+    traffic.configureTrafficSource({
+      async requestRoads(bounds) {
+        roadRequests.push(bounds);
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({ roads: [], roadSource: 'OpenStreetMap' }),
+        };
+      },
+      getStatus: async () => ({ hasKey: false }),
+      fetchFlowForBounds: async () => [],
+    });
 
     globalThis.document = { documentElement: { dataset: {} } };
-    globalThis.fetch = async (url) => ({
-      ok: true,
-      status: 200,
-      headers: { get: () => null },
-      json: async () => (String(url).includes('/api/tomtom/status')
-        ? { hasKey: false }
-        : { elements: [] }),
-    });
     globalThis.setTimeout = (callback, delay) => {
       const id = ++timerId;
       timeouts.set(id, { callback, delay });
@@ -300,7 +305,17 @@ test('traffic timing pairs real ordering to the scheduling change and guards re-
       anchorC.interactionId,
       'a stale callback must not consume the newer C anchor',
     );
+    // The stale callback already loaded the current view without a trace.
+    // Model a final camera position before C runs so it has new work, rather than
+    // expecting a duplicate settled footprint to bypass the ingestion guards.
+    setLongitude(-97.66);
     await runDebouncedLoad();
+    assert.equal(
+      roadRequests.length,
+      3,
+      'A, the stale callback, and C each load a distinct settled view',
+    );
+    assert.notEqual(roadRequests[1].west, roadRequests[2].west);
 
     assert.deepEqual(traffic.getTrafficTimingDiagnostics(), {
       enabled: true,
@@ -319,7 +334,6 @@ test('traffic timing pairs real ordering to the scheduling change and guards re-
     await server?.close();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
-    globalThis.fetch = originalFetch;
     globalThis.setTimeout = originalSetTimeout;
     globalThis.clearTimeout = originalClearTimeout;
     globalThis.setInterval = originalSetInterval;
@@ -366,7 +380,7 @@ test('the timed parser stays source-equivalent to the production parser', () => 
 
   assert.doesNotMatch(SOURCE, /function fetchRoadsTimed\s*\(/);
   assert.doesNotMatch(SOURCE, /function renderRoadsForAltitudeTimed\s*\(/);
-  const fetchBody = canonicalSemanticBody(functionBody('fetchRoads'));
+  const fetchBody = canonicalSemanticBody(functionBody('readRoads'));
   assert.equal(fetchBody.includes('response.text()'), false);
   assert.equal(fetchBody.includes('JSON.parse('), false);
   const okCheck = fetchBody.indexOf('if(!response.ok)');
