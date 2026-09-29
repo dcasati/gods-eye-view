@@ -13,6 +13,8 @@ import {
   overlay,
   environment,
   assertPrivateServices,
+  assertPublicDns,
+  redirectUris,
 } from '../../scripts/aks-auth.mjs';
 import { probeEdge, requestEdge } from '../../scripts/aks-auth-probe.mjs';
 import { createChallengeServer } from '../../infra/aks/auth-acme/server.mjs';
@@ -70,6 +72,57 @@ test('settings reject unsafe origins, secrets, unpinned images and tenant aliase
     assert.throws(() => validateSettings({ ...settings, ...patch }));
 });
 
+test('custom DNS must resolve exclusively to the selected public IP', async () => {
+  const ip = { ipAddress: '192.0.2.15' };
+  await assertPublicDns(settings, ip, async (host, options) => {
+    assert.equal(host, 'example.org');
+    assert.deepEqual(options, { all: true });
+    return [{ address: ip.ipAddress, family: 4 }];
+  });
+  for (const addresses of [
+    [],
+    [{ address: '192.0.2.16', family: 4 }],
+    [
+      { address: ip.ipAddress, family: 4 },
+      { address: '2001:db8::1', family: 6 },
+    ],
+  ]) {
+    await assert.rejects(assertPublicDns(settings, ip, async () => addresses));
+  }
+  await assert.rejects(assertPublicDns(settings, {}, async () => []));
+  await assert.rejects(
+    assertPublicDns(settings, ip, async () => {
+      throw new Error('DNS unavailable');
+    }),
+    /DNS unavailable/,
+  );
+});
+
+test('domain migration allows only explicitly approved exact HTTPS callbacks', () => {
+  const migrated = {
+    ...settings,
+    additionalRedirectOrigins: ['https://old.example.org'],
+  };
+  validateSettings(migrated);
+  assert.deepEqual(redirectUris(migrated), [
+    'https://example.org/oauth2/callback',
+    'https://old.example.org/oauth2/callback',
+  ]);
+  for (const value of [
+    'https://old.example.org',
+    ['http://old.example.org'],
+    ['https://*.example.org'],
+    ['https://old.example.org/path'],
+    ['https://old.example.org:4443'],
+    [settings.origin],
+    ['https://old.example.org', 'https://old.example.org'],
+    [null],
+  ]) {
+    assert.throws(() =>
+      validateSettings({ ...settings, additionalRedirectOrigins: value }),
+    );
+  }
+});
 test('exposure gate rejects direct service bypasses', () => {
   const service = (name, type = 'ClusterIP', extra = {}) => ({
     metadata: { name },

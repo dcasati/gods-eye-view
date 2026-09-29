@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { lookup } from 'node:dns/promises';
 import { probeEdge } from './aks-auth-probe.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -27,6 +28,7 @@ export function validateSettings(settings) {
     'publicIPName',
     'publicIPResourceGroup',
     'assignmentRequired',
+    'additionalRedirectOrigins',
   ];
   assert.deepEqual(
     Object.keys(settings).filter((key) => !allowed.includes(key)),
@@ -58,6 +60,23 @@ export function validateSettings(settings) {
     url.hostname,
     /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/i,
   );
+  if (settings.additionalRedirectOrigins !== undefined) {
+    assert.ok(Array.isArray(settings.additionalRedirectOrigins));
+    const origins = settings.additionalRedirectOrigins;
+    assert.equal(new Set(origins).size, origins.length);
+    for (const origin of origins) {
+      assert.equal(typeof origin, 'string');
+      const extra = new URL(origin);
+      assert.equal(extra.protocol, 'https:');
+      assert.equal(extra.origin, origin);
+      assert.equal(extra.port, '');
+      assert.match(
+        extra.hostname,
+        /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/i,
+      );
+      assert.notEqual(origin, settings.origin);
+    }
+  }
   assert.match(
     settings.image,
     /^quay\.io\/oauth2-proxy\/oauth2-proxy:v7\.15\.2@sha256:[0-9a-f]{64}$/,
@@ -68,6 +87,26 @@ export function validateSettings(settings) {
     'Explicitly choose tenant-wide or assigned-user sign-in',
   );
   return settings;
+}
+
+export function redirectUris(settings) {
+  return [settings.origin, ...(settings.additionalRedirectOrigins || [])]
+    .map((origin) => `${origin}/oauth2/callback`)
+    .sort();
+}
+
+export async function assertPublicDns(settings, publicIP, resolve = lookup) {
+  assert.ok(publicIP.ipAddress, 'Dedicated public IP is not allocated');
+  const addresses = await resolve(new URL(settings.origin).hostname, {
+    all: true,
+  });
+  assert.ok(addresses.length > 0, 'Hostname has no addresses');
+  assert.ok(
+    addresses.every(
+      ({ address, family }) => family === 4 && address === publicIP.ipAddress,
+    ),
+    'Every hostname address must resolve directly to the dedicated public IPv4 address',
+  );
 }
 
 export function environment(settings) {
@@ -340,9 +379,10 @@ export async function main([action, settingsPath]) {
   }
   const application = az('ad', 'app', 'show', '--id', settings.clientId);
   assert.equal(application.signInAudience, 'AzureADMyOrg');
-  assert.deepEqual(application.web.redirectUris, [
-    `${settings.origin}/oauth2/callback`,
-  ]);
+  assert.deepEqual(
+    [...application.web.redirectUris].sort(),
+    redirectUris(settings),
+  );
   assert.equal(
     application.passwordCredentials.length,
     0,
@@ -557,6 +597,30 @@ print(json.dumps(objects))
     [{ name: 'https', port: 443, targetPort: 'https', protocol: 'TCP' }],
   );
   assert.ok(['ClusterIP', 'LoadBalancer'].includes(service.spec.type));
+  let publicIP;
+  if (action === 'activate' || action === 'verify-public') {
+    assert.ok(settings.publicIPName && settings.publicIPResourceGroup);
+    publicIP = az(
+      'network',
+      'public-ip',
+      'show',
+      '-g',
+      settings.publicIPResourceGroup,
+      '-n',
+      settings.publicIPName,
+      '--subscription',
+      settings.subscription,
+    );
+    assert.equal(publicIP.sku.name, 'Standard');
+    assert.equal(publicIP.publicIPAllocationMethod, 'Static');
+    assert.equal(publicIP.location, cluster.location);
+    await assertPublicDns(settings, publicIP);
+    if (action === 'verify-public')
+      assert.deepEqual(
+        service.status.loadBalancer.ingress.map(({ ip }) => ip),
+        [publicIP.ipAddress],
+      );
+  }
   const secretVersions = [`${name}-cookie`, `${name}-tls`].map((secretName) => [
     secretName,
     kube(
@@ -598,21 +662,6 @@ print(json.dumps(objects))
     settings.publicIPName && settings.publicIPResourceGroup,
     'Reserve a dedicated public IP/DNS before activation',
   );
-  const publicIP = az(
-    'network',
-    'public-ip',
-    'show',
-    '-g',
-    settings.publicIPResourceGroup,
-    '-n',
-    settings.publicIPName,
-    '--subscription',
-    settings.subscription,
-  );
-  assert.equal(publicIP.sku.name, 'Standard');
-  assert.equal(publicIP.publicIPAllocationMethod, 'Static');
-  assert.equal(publicIP.location, cluster.location);
-  assert.equal(publicIP.dnsSettings?.fqdn, new URL(settings.origin).hostname);
   assert.ok(
     !publicIP.ipConfiguration,
     'Public IP must not still be attached to a certificate-validation Service',

@@ -63,7 +63,8 @@ to stop for review.
 | `origin` | Exact `https://hostname`, standard port 443, no trailing slash |
 | `image` | Official `quay.io/oauth2-proxy/oauth2-proxy:v7.15.2@sha256:<verified-digest>` |
 | `assignmentRequired` | `true`: explicitly assigned users/groups only; `false`: directory users including invited guests, subject to tenant consent/Conditional Access |
-| `publicIPName`, `publicIPResourceGroup` | Dedicated Standard static IP with an Azure-assigned DNS hostname, used by the activation script |
+| `publicIPName`, `publicIPResourceGroup` | Dedicated Standard static IP used by the activation script |
+| `additionalRedirectOrigins` | Optional list of exact HTTPS origins whose Entra callbacks are deliberately retained during migration; no wildcard hosts or paths |
 
 The default profile requests only `openid`, uses the immutable `sub` claim as its
 identity identifier, and needs no Graph permissions or email-suffix trust.
@@ -107,10 +108,24 @@ export AKS_ISSUER="$(az aks show -g "$RESOURCE_GROUP" -n "$CLUSTER_NAME" \
   --query oidcIssuerProfile.issuerUrl -o tsv)"
 ```
 
-An owned custom hostname/certificate is also suitable for the manifests. The
-automated activation command intentionally verifies the IP's Azure DNS hostname;
-custom DNS requires adapting that check to prove DNS ownership and resolution,
-not bypassing TLS verification.
+An owned custom hostname is also supported. Create an A record pointing to the
+dedicated public IP and set `origin` to that exact HTTPS origin. Activation and
+public verification require every resolved address to match the dedicated IPv4
+address; remove stale AAAA records and disable DNS-provider proxying for this
+direct-load-balancer setup. The private gate still verifies a publicly trusted
+certificate for the requested hostname; DNS resolution alone does not prove
+domain control.
+
+For an existing deployment, issue the new hostname's certificate before changing
+the proxy configuration. Preserve the old certificate securely for rollback.
+Register the new `/oauth2/callback` with the existing Entra application without
+discarding existing callbacks; list any retained origins explicitly in
+`additionalRedirectOrigins`. The gate checks the exact complete callback set.
+Change `origin`, prepare the auth-only overlay, update only the TLS Secret, and
+apply during a private maintenance window. Then verify and activate again.
+Cookies remain host-only, so users must sign in again on the new hostname.
+An old hostname needs certificate coverage to remain usable; a retained Entra
+callback by itself does not keep its HTTPS endpoint working.
 
 ## 2. Register a Separate Secretless Entra Application
 
